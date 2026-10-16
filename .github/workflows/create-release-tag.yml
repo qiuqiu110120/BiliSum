@@ -1,0 +1,131 @@
+name: Create Release Tag
+
+# 「Release vX.Y.Z」PR 合并后：校验版本文件与标题一致，打 tag 并推送，
+# 随后触发 release.yml 构建与发布。
+#
+# 触发方式：
+# - 自动：Release PR 合并（pull_request_target: closed）
+# - 手动兜底（workflow_dispatch）：若自动打 tag 未触发/失败，可在 Actions
+#   页面手动运行本 workflow 并填写版本号（如 1.20.0-alpha.1），从 master
+#   最新提交补打 tag
+#
+# 注意：使用 pull_request_target 而非 pull_request —— 由 workflow 自动创建
+# 的 Release PR 合并时，pull_request 的 closed 事件不会触发 workflow（与
+# labeled/unlabeled 相同的平台限制），pull_request_target 则正常触发。
+
+on:
+  pull_request_target:
+    types:
+      - closed
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "手动补打 tag 的版本号（如 1.20.0-alpha.1）"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  create-release-tag:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       startsWith(github.event.pull_request.title, 'Release v'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+          # Tag the exact merge commit on the default branch (pull_request_target
+          # runs against the base branch, but the merged SHA is authoritative).
+          # On a manual dispatch, use the default branch head.
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Extract release version
+        id: version
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          MANUAL_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MANUAL_VERSION}" ]; then
+            version="$(printf '%s' "${MANUAL_VERSION}" | sed 's/^v//' | tr -d '[:space:]')"
+          else
+            version="$(printf '%s' "${PR_TITLE}" | sed -E 's/^Release[[:space:]]+v//' | tr -d '[:space:]')"
+          fi
+          if ! printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "Invalid version: '${version}'" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version files match the release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          source_version="$(cat VERSION | tr -d '[:space:]')"
+          if [ "${source_version}" != "${VERSION}" ]; then
+            echo "Version files (${source_version}) do not match release v${VERSION}." >&2
+            exit 1
+          fi
+          python scripts/bump_version.py --check
+
+      - name: Push release tag
+        id: push_tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists; skip."
+            echo "tag_created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git"
+          git tag -a "${tag}" -m "${tag}"
+          git push origin "refs/tags/${tag}"
+          echo "tag_created=true" >> "$GITHUB_OUTPUT"
+
+      - name: Report tag status on the commit
+        if: ${{ steps.push_tag.outputs.tag_created == 'true' }}
+        env:
+          SHA: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          TAG: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/statuses/${SHA}" \
+            -f state=success \
+            -f context=release/tag \
+            -f description="v${TAG} tag 已创建" \
+            -f target_url="${RUN_URL}" >/dev/null
+          echo "release/tag -> success (v${TAG})"
+
+      - name: Trigger release build
+        # A tag pushed by a workflow token does not fire the `push.tags`
+        # workflow trigger (GitHub platform behaviour), so dispatch the
+        # Release workflow explicitly.
+        if: ${{ steps.push_tag.outputs.tag_created == 'true' }}
+        env:
+          TAG: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml -f release_tag="v${TAG}"
+          echo "Dispatched release.yml for v${TAG}."
+

@@ -16,6 +16,7 @@ import {
 } from "./appModel";
 import { AuthRequiredError, api } from "./api";
 import { HomeIcon, KnowledgeIcon, LibraryIcon, SettingsIcon } from "./components/AppIcons";
+import { CollectionSelectDialog } from "./components/CollectionSelectDialog";
 import { CookieHelpDialog } from "./components/CookieHelpDialog";
 import { MultiPageSelectDialog } from "./components/MultiPageSelectDialog";
 import { SetupAssistantDialog } from "./components/SetupAssistantDialog";
@@ -26,9 +27,10 @@ import { HomeTour, isHomeTourSeen } from "./components/HomeTour";
 import { HomePage } from "./pages/HomePage";
 import { KnowledgePage } from "./pages/KnowledgePage";
 import { LibraryPage } from "./pages/LibraryPage";
+import { CollectionDetailPage } from "./pages/CollectionDetailPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { VideoDetailPage } from "./pages/VideoDetailPage";
-import type { VideoAssetSummary, VideoPageBatchOption, VideoProbeResult } from "./types";
+import type { CollectionGroupMode, CollectionSortMode, VideoAssetSummary, VideoCollection, VideoCollectionItem, VideoPageBatchOption, VideoProbeResult } from "./types";
 
 const PROMPT_PRESET_STORAGE_KEY = "bilisum.promptPresetId";
 
@@ -36,6 +38,63 @@ function isAuthRequiredError(error: unknown): error is AuthRequiredError {
   return error instanceof AuthRequiredError
     || (error instanceof Error && error.name === "AuthRequiredError")
     || (error instanceof Error && /访问密钥|unauthorized|401/i.test(error.message));
+}
+
+function readableTaskCreationError(error: unknown): string {
+  const message = error instanceof Error ? error.message.trim() : "";
+  if (!message || /^Internal Server Error$/i.test(message)) {
+    return "服务端暂时无法创建任务，请检查运行状态后重试。";
+  }
+  if (/LLM returned no readable message content/i.test(message)) {
+    return "LLM 没有返回可读取的内容，已按设置进行重试；请检查模型响应格式。";
+  }
+  return message;
+}
+
+async function settleWithConcurrency<TItem, TResult>(
+  items: TItem[],
+  concurrency: number,
+  worker: (item: TItem, index: number) => Promise<TResult>,
+): Promise<Array<PromiseSettledResult<TResult>>> {
+  const results = new Array<PromiseSettledResult<TResult>>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency) || 1));
+
+  async function runWorker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      try {
+        results[index] = { status: "fulfilled", value: await worker(items[index]!, index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
+function readAuthTokenFromUrl(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const match = window.location.hash.match(/[#&]token=([^&]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function clearAuthTokenFromUrl(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  // Drop the #token fragment without triggering a router navigation.
+  window.history.replaceState(
+    window.history.state,
+    "",
+    window.location.pathname + window.location.search,
+  );
 }
 
 export function App() {
@@ -48,6 +107,10 @@ export function App() {
   const [probeUrl, setProbeUrl] = useState("");
   const [submitStatus, setSubmitStatus] = useState("");
   const [probePreview, setProbePreview] = useState<VideoAssetSummary | null>(null);
+  const [collectionDialogOpen, setCollectionDialogOpen] = useState(false);
+  const [collectionProbeVideo, setCollectionProbeVideo] = useState<VideoAssetSummary | null>(null);
+  const [collectionProbe, setCollectionProbe] = useState<VideoCollection | null>(null);
+  const [collectionProbeCached, setCollectionProbeCached] = useState(false);
   const [multiPageDialogOpen, setMultiPageDialogOpen] = useState(false);
   const [multiPageProbeVideo, setMultiPageProbeVideo] = useState<VideoAssetSummary | null>(null);
   const [multiPageOptions, setMultiPageOptions] = useState<VideoPageBatchOption[]>([]);
@@ -86,6 +149,11 @@ export function App() {
   const [cookieHelpDialogOpen, setCookieHelpDialogOpen] = useState(false);
   const [setupAssistantDismissed, setSetupAssistantDismissed] = useState(false);
   const setupAssistantForceRef = useRef(false);
+  // A periodic refresh can finish after a settings PUT. Keep older responses
+  // from putting the previous LLM configuration back into the UI.
+  const refreshRequestIdRef = useRef(0);
+  const settingsWriteVersionRef = useRef(0);
+  const collectionBatchRetryIdsRef = useRef(new Map<string, string>());
   const [homeTourOpen, setHomeTourOpen] = useState(() => !isHomeTourSeen());
 
   useEffect(() => {
@@ -116,6 +184,23 @@ export function App() {
           setAuthenticated(true);
           setAuthChecked(true);
         }
+        return;
+      }
+      const urlToken = readAuthTokenFromUrl();
+      if (urlToken) {
+        try {
+          const status = await api.createAuthSession(urlToken);
+          if (!disposed) {
+            setAuthenticated(Boolean(status.authenticated));
+            setAuthChecked(true);
+          }
+        } catch {
+          if (!disposed) {
+            setAuthenticated(false);
+            setAuthChecked(true);
+          }
+        }
+        clearAuthTokenFromUrl();
         return;
       }
       try {
@@ -189,19 +274,27 @@ export function App() {
       if (!authenticated) {
         return;
       }
+      const requestId = refreshRequestIdRef.current + 1;
+      refreshRequestIdRef.current = requestId;
+      const settingsWriteVersion = settingsWriteVersionRef.current;
       try {
         const [health, settings, library] = await Promise.all([
           api.getHealth(),
           api.getSettings(),
           api.getVideoLibrary(),
         ]);
-        if (!disposed) {
+        if (
+          !disposed
+          && requestId === refreshRequestIdRef.current
+          && settingsWriteVersion === settingsWriteVersionRef.current
+        ) {
           setSnapshot((current) => ({
             ...current,
             serviceOnline: health.status === "ok",
             settings,
             videos: library.videos,
             folders: library.folders,
+            collections: library.collections || [],
             libraryPreferences: library.preferences,
             error: "",
           }));
@@ -209,7 +302,11 @@ export function App() {
 
         try {
           const systemInfo = await api.getSystemInfo();
-          if (!disposed) {
+          if (
+            !disposed
+            && requestId === refreshRequestIdRef.current
+            && settingsWriteVersion === settingsWriteVersionRef.current
+          ) {
             const runtimeStartupStatus = systemInfo.runtimeStartup?.status;
             const environment = systemInfo.environment ?? systemInfo.runtimeStartup?.environment ?? null;
             const runtimeInitializing = runtimeStartupStatus === "initializing" || environment?.runtimeReady === false;
@@ -223,7 +320,11 @@ export function App() {
             }));
           }
         } catch (error) {
-          if (!disposed) {
+          if (
+            !disposed
+            && requestId === refreshRequestIdRef.current
+            && settingsWriteVersion === settingsWriteVersionRef.current
+          ) {
             setSnapshot((current) => ({
               ...current,
               serviceOnline: health.status === "ok",
@@ -233,7 +334,11 @@ export function App() {
           }
         }
       } catch (error) {
-        if (!disposed) {
+        if (
+          !disposed
+          && requestId === refreshRequestIdRef.current
+          && settingsWriteVersion === settingsWriteVersionRef.current
+        ) {
           if (isAuthRequiredError(error)) {
             setAuthenticated(false);
             setAuthError("");
@@ -340,18 +445,19 @@ export function App() {
   }, [snapshot.videos]);
 
   const libraryCounts = useMemo(() => {
-    const favorite = snapshot.videos.filter((item) => item.is_favorite).length;
+    const favorite = snapshot.videos.filter((item) => item.is_favorite).length + snapshot.collections.filter((item) => item.is_favorite).length;
     const completed = snapshot.videos.filter((item) => item.latest_status === "completed").length;
     const running = snapshot.videos.filter((item) => item.latest_status === "running").length;
     const withResult = snapshot.videos.filter((item) => item.has_result).length;
     return {
-      total: snapshot.videos.length,
+      total: snapshot.videos.length + snapshot.collections.length,
+      collection: snapshot.collections.length,
       favorite,
       completed,
       running,
       withResult,
     };
-  }, [snapshot.videos]);
+  }, [snapshot.collections, snapshot.videos]);
 
   const filteredVideos = useMemo(() => {
     const keyword = query.trim().toLowerCase();
@@ -362,6 +468,7 @@ export function App() {
         return video.title.toLowerCase().includes(keyword) || video.source_url.toLowerCase().includes(keyword);
       })
       .filter((video) => {
+        if (libraryFilter === "collection") return false;
         if (libraryFilter === "favorite") return video.is_favorite;
         if (libraryFilter === "completed") return video.latest_status === "completed";
         if (libraryFilter === "running") return video.latest_status === "running";
@@ -370,21 +477,30 @@ export function App() {
       });
   }, [libraryFilter, query, snapshot.videos]);
 
-  const favoriteVideos = useMemo(() => {
-    return [...snapshot.videos]
+  const favoriteItems = useMemo(() => {
+    const videos = snapshot.videos
       .filter((video) => video.is_favorite)
-      .sort((left, right) => {
-        const leftTime = new Date(left.favorite_updated_at || left.updated_at).getTime();
-        const rightTime = new Date(right.favorite_updated_at || right.updated_at).getTime();
-        return rightTime - leftTime;
-      });
-  }, [snapshot.videos]);
+      .map((video) => ({ kind: "video" as const, video, sortAt: video.favorite_updated_at || video.updated_at }));
+    const collections = snapshot.collections
+      .filter((collection) => collection.is_favorite)
+      .map((collection) => ({ kind: "collection" as const, collection, sortAt: collection.favorite_updated_at || collection.latest_video_updated_at || collection.last_checked_at || "" }));
+    return [...videos, ...collections]
+      .sort((left, right) => new Date(right.sortAt).getTime() - new Date(left.sortAt).getTime())
+      .map(({ sortAt: _sortAt, ...item }) => item);
+  }, [snapshot.collections, snapshot.videos]);
 
-  const recentVideos = useMemo(() => {
-    return [...snapshot.videos]
-      .sort((left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime())
-      .slice(0, 6);
-  }, [snapshot.videos]);
+  const recentItems = useMemo(() => {
+    const videos = snapshot.videos.map((video) => ({ kind: "video" as const, video, sortAt: video.updated_at }));
+    const collections = snapshot.collections.map((collection) => ({
+      kind: "collection" as const,
+      collection,
+      sortAt: collection.latest_video_updated_at || collection.last_checked_at || "",
+    }));
+    return [...videos, ...collections]
+      .sort((left, right) => new Date(right.sortAt).getTime() - new Date(left.sortAt).getTime())
+      .slice(0, 6)
+      .map(({ sortAt: _sortAt, ...item }) => item);
+  }, [snapshot.collections, snapshot.videos]);
 
   async function handleToggleFavorite(videoId: string, nextFavorite: boolean) {
     const previousVideos = snapshot.videos;
@@ -498,6 +614,7 @@ export function App() {
       ...current,
       videos: library.videos,
       folders: library.folders,
+      collections: library.collections || [],
       libraryPreferences: library.preferences,
     }));
     return library;
@@ -554,9 +671,128 @@ export function App() {
     mergeVideos(updated);
   }
 
+  async function handleReorderVideoLibrary(items: Array<{ kind: "video" | "collection"; id: string }>, folderId?: string | null) {
+    const library = await api.reorderVideoLibrary({ items, ...(folderId === undefined ? {} : { folder_id: folderId }) });
+    setSnapshot((current) => ({
+      ...current,
+      videos: library.videos,
+      folders: library.folders,
+      collections: library.collections || [],
+      libraryPreferences: library.preferences,
+    }));
+  }
+
   async function handleUpdateLibraryPreferences(newVideoPosition: "front" | "back") {
     const preferences = await api.updateVideoLibraryPreferences({ new_video_position: newVideoPosition });
     setSnapshot((current) => ({ ...current, libraryPreferences: preferences }));
+  }
+
+  function mergeCollection(collection: VideoCollection) {
+    setSnapshot((current) => ({
+      ...current,
+      collections: current.collections.some((item) => item.collection_id === collection.collection_id)
+        ? current.collections.map((item) => item.collection_id === collection.collection_id ? collection : item)
+        : [collection, ...current.collections],
+    }));
+  }
+
+  async function handleRefreshCollection(collectionId: string) {
+    const collection = await api.refreshVideoCollection(collectionId);
+    mergeCollection(collection);
+    return collection;
+  }
+
+  async function handleAddCollectionItems(collectionId: string, bvids: string[]) {
+    const collection = await api.addVideoCollectionItems(collectionId, bvids);
+    mergeCollection(collection);
+    await refreshLibrarySnapshot();
+    return collection;
+  }
+
+  async function handleUpdateCollectionSettings(collectionId: string, autoCheckOnOpen: boolean) {
+    const collection = await api.updateVideoCollectionSettings(collectionId, { auto_check_on_open: autoCheckOnOpen });
+    mergeCollection(collection);
+    return collection;
+  }
+
+  async function handleUpdateCollectionView(
+    collectionId: string,
+    payload: { view_sort_mode?: CollectionSortMode; view_group_mode?: CollectionGroupMode },
+  ) {
+    const collection = await api.updateVideoCollectionSettings(collectionId, payload);
+    mergeCollection(collection);
+    return collection;
+  }
+
+  async function handleReorderCollectionItems(collectionId: string, orderedBvids: string[]) {
+    const collection = await api.reorderVideoCollectionItems(collectionId, orderedBvids);
+    mergeCollection(collection);
+    return collection;
+  }
+
+  async function handleToggleCollectionFavorite(collectionId: string, nextFavorite: boolean) {
+    const collection = await api.setVideoCollectionFavorite(collectionId, { is_favorite: nextFavorite });
+    mergeCollection(collection);
+    return collection;
+  }
+
+  async function handleMoveCollection(collectionId: string, folderId?: string | null, folderIds?: string[]) {
+    const collection = await api.moveVideoCollectionToFolder(collectionId, folderIds ? { folder_ids: folderIds } : { folder_id: folderId ?? null });
+    mergeCollection(collection);
+    return collection;
+  }
+
+  async function handleSetCollectionPin(collectionId: string, payload: { global_pinned?: boolean | null; folder_pinned?: boolean | null }) {
+    const collection = await api.setVideoCollectionPin(collectionId, payload);
+    mergeCollection(collection);
+    return collection;
+  }
+
+  async function handleDeleteCollection(collectionId: string, mode: "detach" | "delete_contents") {
+    await api.deleteVideoCollection(collectionId, mode);
+    await refreshLibrarySnapshot();
+  }
+
+  async function handlePromoteCollectionItem(collectionId: string, videoId: string) {
+    const updated = await api.promoteVideoCollectionItem(collectionId, videoId);
+    mergeVideos([updated]);
+    setSnapshot((current) => ({
+      ...current,
+      collections: current.collections.map((collection) => collection.collection_id !== collectionId
+        ? collection
+        : {
+          ...collection,
+          items: collection.items.map((item) => item.video_id === videoId ? { ...item, is_global_visible: true } : item),
+        }),
+    }));
+    return updated;
+  }
+
+  async function handleSummarizeCollectionItems(collectionId: string, videoIds: string[]) {
+    if (!videoIds.length) return;
+    setSubmitStatus(`正在按指定顺序创建 ${videoIds.length} 个合集摘要任务...`);
+    const taskPayload = await buildCreateTaskPayload(null, "合集视频");
+    const batchKey = JSON.stringify({
+      collectionId,
+      videoIds,
+      visualNoteMode: taskPayload.visual_note_mode,
+      promptPresetId: taskPayload.prompt_preset_id,
+    });
+    const batchId = collectionBatchRetryIdsRef.current.get(batchKey) || crypto.randomUUID();
+    collectionBatchRetryIdsRef.current.set(batchKey, batchId);
+    const result = await api.createVideoCollectionTasks(collectionId, {
+      batch_id: batchId,
+      ordered_video_ids: [...videoIds],
+      visual_note_mode: taskPayload.visual_note_mode,
+      prompt_preset_id: taskPayload.prompt_preset_id,
+    });
+    collectionBatchRetryIdsRef.current.delete(batchKey);
+    const createdCount = result.created_tasks.length;
+    await refreshLibrarySnapshot();
+    setRefreshSeed((value) => value + 1);
+    setSubmitStatus(result.dispatch_failures.length
+      ? `已创建 ${createdCount} 个任务，其中 ${result.dispatch_failures.length} 个未能启动`
+      : `已创建 ${createdCount} 个合集视频摘要任务`);
   }
 
   function openConfigAssist(issueKey?: string) {
@@ -706,6 +942,87 @@ export function App() {
     }
   }
 
+  function startSingleVideoSummary(video: VideoAssetSummary, sourceText: string, cached: boolean) {
+    setSubmitStatus(cached ? "已从视频库读取，正在进入详情页..." : "视频已加入本地库，正在进入详情页...");
+    setProbeUrl("");
+    setRefreshSeed((value) => value + 1);
+    navigate(`/videos/${video.video_id}`);
+    void createVideoTaskAfterNavigation(video, video.title || sourceText);
+  }
+
+  function startCollectionSummary(
+    collection: VideoCollection,
+    items: VideoCollectionItem[],
+    currentVideo?: VideoAssetSummary,
+  ) {
+    if (!items.length) {
+      setSubmitStatus("请至少选择一个合集视频");
+      return;
+    }
+    setProbeUrl("");
+    setSubmitStatus("已添加合集总结任务");
+    void processCollectionSummary(collection, items, currentVideo);
+  }
+
+  async function processCollectionSummary(
+    collection: VideoCollection,
+    items: VideoCollectionItem[],
+    currentVideo?: VideoAssetSummary,
+  ) {
+    try {
+      const taskPayloadPromise = buildCreateTaskPayload(null, collection.title);
+      let collectionOpened = false;
+      const openCollection = () => {
+        if (collectionOpened) return;
+        collectionOpened = true;
+        setRefreshSeed((value) => value + 1);
+        navigate(`/collections/${collection.collection_id}`);
+      };
+
+      const probeConcurrency = Math.max(
+        1,
+        Number(snapshot.settings?.transcription_concurrency || snapshot.settings?.task_concurrency) || 1,
+      );
+      const results = await settleWithConcurrency(items, probeConcurrency, async (item) => {
+        const isCurrentVideo = Boolean(currentVideo && (
+          item.video_id === currentVideo.video_id
+          || item.bvid === currentVideo.canonical_id
+          || item.source_url === currentVideo.source_url
+        ));
+        const response = isCurrentVideo
+          ? null
+          : await api.probeVideo({ url: item.source_url, force_refresh: false });
+        if (response?.requires_selection) {
+          throw new Error(`合集视频“${item.title}”还包含分 P，请先单独选择分 P。`);
+        }
+        const targetVideo = response?.video || currentVideo;
+        if (!targetVideo) {
+          throw new Error(`合集视频“${item.title}”未返回有效视频信息。`);
+        }
+        await api.createVideoTask(targetVideo.video_id, await taskPayloadPromise);
+        openCollection();
+        return targetVideo;
+      });
+      const successfulVideos = results
+        .filter((result): result is PromiseFulfilledResult<VideoAssetSummary> => result.status === "fulfilled")
+        .map((result) => result.value);
+      if (!successfulVideos.length) {
+        const failedResult = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        throw failedResult?.reason instanceof Error ? failedResult.reason : new Error("合集没有可处理的视频。");
+      }
+
+      await refreshLibrarySnapshot().catch(() => undefined);
+      setDetailRefreshToken((value) => value + 1);
+    } catch (error) {
+      const message = readableTaskCreationError(error);
+      if (isBilibiliCookieHelpError(message)) {
+        showBilibiliCookieHelp(message);
+        return;
+      }
+      setSubmitStatus(message);
+    }
+  }
+
   async function handleProbe(event: FormEvent) {
     event.preventDefault();
     if (!probeUrl.trim()) {
@@ -726,6 +1043,14 @@ export function App() {
     try {
       const response = await api.probeVideo({ url: probeUrl.trim(), force_refresh: false });
       setProbePreview(response.video);
+      if (response.collection?.items?.length) {
+        setCollectionProbeVideo(response.video);
+        setCollectionProbe(response.collection);
+        setCollectionProbeCached(response.cached);
+        setCollectionDialogOpen(true);
+        setSubmitStatus(`检测到合集《${response.collection.title}》，请先选择总结范围`);
+        return;
+      }
       if (response.requires_selection && response.pages.length > 0) {
         setMultiPageProbeVideo(response.video);
         setMultiPageOptions(response.pages.map((page) => ({ ...page, aggregate_status: "not_started", has_completed_result: false })));
@@ -733,12 +1058,8 @@ export function App() {
         setSubmitStatus(`检测到 ${response.pages.length} 个分 P，请先勾选要处理的内容`);
         return;
       }
-      setSubmitStatus(response.cached ? "已从视频库读取，正在进入详情页..." : "视频已加入本地库，正在进入详情页...");
       const submittedUrl = probeUrl.trim();
-      setProbeUrl("");
-      setRefreshSeed((value) => value + 1);
-      navigate(`/videos/${response.video.video_id}`);
-      void createVideoTaskAfterNavigation(response.video, response.video.title || submittedUrl);
+      startSingleVideoSummary(response.video, submittedUrl, response.cached);
     } catch (error) {
       const message = error instanceof Error ? error.message : "开始总结失败";
       if (isBilibiliCookieHelpError(message)) {
@@ -747,6 +1068,34 @@ export function App() {
       }
       setSubmitStatus(message);
     }
+  }
+
+  function handleCloseCollectionDialog() {
+    setCollectionDialogOpen(false);
+    setCollectionProbeVideo(null);
+    setCollectionProbe(null);
+    setCollectionProbeCached(false);
+    setSubmitStatus("已取消合集选择");
+  }
+
+  function handleChooseCollection(scope: "single" | "collection", items: VideoCollectionItem[] = []) {
+    if (!collectionProbeVideo || !collectionProbe) {
+      handleCloseCollectionDialog();
+      return;
+    }
+    const currentVideo = collectionProbeVideo;
+    const currentCollection = collectionProbe;
+    setCollectionDialogOpen(false);
+    setCollectionProbeVideo(null);
+    setCollectionProbe(null);
+    const wasCached = collectionProbeCached;
+    setCollectionProbeCached(false);
+    if (scope === "single") {
+      void refreshLibrarySnapshot().catch(() => undefined);
+      startSingleVideoSummary(currentVideo, currentVideo.source_url, wasCached);
+      return;
+    }
+    startCollectionSummary(currentCollection, items, currentVideo);
   }
 
   async function createLocalPathTasks(filePaths: string[]) {
@@ -978,6 +1327,7 @@ export function App() {
         version={runtimeVersionLabel}
         updateState={updateState}
         configHealth={configHealth}
+        worker={snapshot.systemInfo?.worker}
         onOpenSettings={openConfigAssist}
         onOpenUpdateDialog={openUpdateDialog}
       />
@@ -987,28 +1337,24 @@ export function App() {
             <span className="nav-icon" aria-hidden="true"><HomeIcon /></span>
             <span className="nav-copy">
               <strong>首页</strong>
-              <small>工作台总览</small>
             </span>
           </Link>
           <Link className={`nav-item ${location.pathname === "/library" ? "active" : ""}`} to="/library" aria-label="视频库" title="视频库" onClick={() => setMobileSidebarOpen(false)}>
             <span className="nav-icon" aria-hidden="true"><LibraryIcon /></span>
             <span className="nav-copy">
               <strong>视频库</strong>
-              <small>资产管理</small>
             </span>
           </Link>
           <Link className={`nav-item ${location.pathname === "/knowledge" ? "active" : ""}`} to="/knowledge" aria-label="知识库" title="知识库" onClick={() => setMobileSidebarOpen(false)}>
             <span className="nav-icon" aria-hidden="true"><KnowledgeIcon /></span>
             <span className="nav-copy">
               <strong>知识库</strong>
-              <small>检索与问答</small>
             </span>
           </Link>
           <Link className={`nav-item ${location.pathname.startsWith("/settings") ? "active" : ""}`} to="/settings" aria-label="设置" title="设置" onClick={() => setMobileSidebarOpen(false)}>
             <span className="nav-icon" aria-hidden="true"><SettingsIcon /></span>
             <span className="nav-copy">
               <strong>设置</strong>
-              <small>运行配置</small>
             </span>
           </Link>
         </nav>
@@ -1088,7 +1434,7 @@ export function App() {
                     probePreview={probePreview}
                     probeUrl={probeUrl}
                     setProbeUrl={setProbeUrl}
-                    submitStatus={submitStatus}
+                    submitStatus={collectionDialogOpen ? "" : submitStatus}
                     onProbe={handleProbe}
                     onImportLocalVideo={handleImportLocalVideo}
                     onImportLocalFiles={handleLocalFilesSelected}
@@ -1099,9 +1445,10 @@ export function App() {
                     onOpenSetupAssistant={openConfigAssist}
                     onOpenConfigIssue={navigateToConfigIssue}
                     onEditPromptPreset={navigateToPromptPreset}
-                    favoriteVideos={favoriteVideos}
-                    recentVideos={recentVideos}
+                    favoriteItems={favoriteItems}
+                    recentItems={recentItems}
                     onToggleFavorite={handleToggleFavorite}
+                    onToggleCollectionFavorite={handleToggleCollectionFavorite}
                   />
                 )}
               />
@@ -1127,11 +1474,33 @@ export function App() {
                     onMoveVideo={handleMoveVideo}
                     onSetVideoPin={handleSetVideoPin}
                     onReorderVideos={handleReorderVideos}
+                    onReorderVideoLibrary={handleReorderVideoLibrary}
+                    onRefreshCollection={handleRefreshCollection}
+                    onToggleCollectionFavorite={handleToggleCollectionFavorite}
+                    onMoveCollection={handleMoveCollection}
+                    onSetCollectionPin={handleSetCollectionPin}
+                    onDeleteCollection={handleDeleteCollection}
                     onUpdateLibraryPreferences={handleUpdateLibraryPreferences}
                   />
                 )}
               />
               <Route path="/knowledge" element={<KnowledgePage />} />
+              <Route
+                path="/collections/:collectionId"
+                element={(
+                  <CollectionDetailPage
+                    serviceOnline={snapshot.serviceOnline}
+                    onRefreshCollection={handleRefreshCollection}
+                    onAddCollectionItems={handleAddCollectionItems}
+                    onUpdateCollectionSettings={handleUpdateCollectionSettings}
+                    onUpdateCollectionView={handleUpdateCollectionView}
+                    onReorderCollectionItems={handleReorderCollectionItems}
+                    onDeleteCollection={handleDeleteCollection}
+                    onPromoteCollectionItem={handlePromoteCollectionItem}
+                    onSummarizeCollectionItems={handleSummarizeCollectionItems}
+                  />
+                )}
+              />
               <Route
                 path="/videos/:videoId"
                 element={(
@@ -1161,6 +1530,7 @@ export function App() {
                     }}
                     onRefresh={() => setRefreshSeed((value) => value + 1)}
                     onSettingsSaved={(settings, environment) => {
+                      settingsWriteVersionRef.current += 1;
                       setSnapshot((current) => ({
                         ...current,
                         settings,
@@ -1209,6 +1579,13 @@ export function App() {
         pages={multiPageOptions}
         onClose={handleCloseMultiPageDialog}
         onSubmit={handleConfirmMultiPage}
+      />
+      <CollectionSelectDialog
+        isOpen={collectionDialogOpen}
+        video={collectionProbeVideo}
+        collection={collectionProbe}
+        onClose={handleCloseCollectionDialog}
+        onChoose={handleChooseCollection}
       />
       <SetupAssistantDialog
         isOpen={setupAssistantOpen}

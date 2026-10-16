@@ -20,6 +20,7 @@ class VideoTaskCreateRequest(BaseModel):
     page_number: int | None = None
     visual_note_mode: str | None = None
     prompt_preset_id: str | None = None
+    summary_scope: str | None = None
 
 
 class VideoTaskBatchRequest(BaseModel):
@@ -132,6 +133,16 @@ class VideoReorderRequest(BaseModel):
     folder_id: str | None = None
 
 
+class VideoLibraryReorderItem(BaseModel):
+    kind: Literal["video", "collection"]
+    id: str
+
+
+class VideoLibraryReorderRequest(BaseModel):
+    items: list[VideoLibraryReorderItem] = Field(default_factory=list)
+    folder_id: str | None = "__global__"
+
+
 class VideoFolderResponse(BaseModel):
     folder_id: str
     parent_id: str | None = None
@@ -149,6 +160,63 @@ class VideoPageOptionResponse(BaseModel):
     duration: float | None = None
 
 
+class VideoCollectionItemResponse(BaseModel):
+    position: int
+    custom_position: float | None = None
+    bvid: str
+    title: str
+    source_url: str
+    cover_url: str = ""
+    duration: float | None = None
+    source_section_id: str | None = None
+    source_section_title: str | None = None
+    source_section_position: int | None = None
+    is_current: bool = False
+    video_id: str | None = None
+    has_result: bool = False
+    latest_status: TaskStatus | None = None
+    last_summary_at: datetime | None = None
+    asset_updated_at: datetime | None = None
+    is_global_visible: bool = False
+    is_new: bool = False
+
+
+class VideoCollectionResponse(BaseModel):
+    collection_id: str
+    title: str
+    cover_url: str = ""
+    global_order: float = 0
+    folder_order: float = 0
+    folder_id: str | None = None
+    folder_ids: list[str] = Field(default_factory=list)
+    global_pinned: bool = False
+    folder_pinned: bool = False
+    is_favorite: bool = False
+    favorite_updated_at: datetime | None = None
+    latest_video_updated_at: datetime | None = None
+    owner_mid: str | None = None
+    owner_name: str | None = None
+    owner_face: str | None = None
+    owner_url: str | None = None
+    item_count: int = 0
+    items: list[VideoCollectionItemResponse] = Field(default_factory=list)
+    source_url: str = ""
+    summarized_count: int = 0
+    unsummarized_count: int = 0
+    last_checked_at: datetime | None = None
+    auto_check_on_open: bool = True
+    view_sort_mode: Literal[
+        "source",
+        "source_desc",
+        "recent_summary",
+        "recent_update",
+        "duration",
+        "custom",
+    ] = "source"
+    view_group_mode: Literal["none", "status", "source_section"] = "none"
+    new_items: list[VideoCollectionItemResponse] = Field(default_factory=list)
+
+
 class VideoAssetSummaryResponse(BaseModel):
     video_id: str
     canonical_id: str
@@ -160,6 +228,10 @@ class VideoAssetSummaryResponse(BaseModel):
     latest_task_id: str | None = None
     latest_status: TaskStatus | None = None
     latest_stage: str | None = None
+    latest_task_created_at: datetime | None = None
+    latest_task_completed_at: datetime | None = None
+    latest_task_duration_seconds: float | None = None
+    last_summary_at: datetime | None = None
     has_result: bool = False
     is_favorite: bool = False
     favorite_updated_at: datetime | None = None
@@ -169,6 +241,7 @@ class VideoAssetSummaryResponse(BaseModel):
     folder_order: float = 0
     global_pinned: bool = False
     folder_pinned: bool = False
+    is_global_visible: bool = True
     pages: list[VideoPageOptionResponse] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
@@ -190,6 +263,10 @@ class VideoAssetRecord(BaseModel):
     latest_task_id: str | None = None
     latest_status: TaskStatus | None = None
     latest_stage: str | None = None
+    latest_task_created_at: datetime | None = None
+    latest_task_completed_at: datetime | None = None
+    latest_task_duration_seconds: float | None = None
+    last_summary_at: datetime | None = None
     latest_result: TaskResult | None = None
     latest_error_message: str | None = None
     is_favorite: bool = False
@@ -200,6 +277,7 @@ class VideoAssetRecord(BaseModel):
     folder_order: float = 0
     global_pinned: bool = False
     folder_pinned: bool = False
+    is_global_visible: bool = True
     pages: list[VideoPageOptionResponse] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -216,6 +294,10 @@ class VideoAssetRecord(BaseModel):
             latest_task_id=self.latest_task_id,
             latest_status=self.latest_status,
             latest_stage=self.latest_stage,
+            latest_task_created_at=self.latest_task_created_at,
+            latest_task_completed_at=self.latest_task_completed_at,
+            latest_task_duration_seconds=self.latest_task_duration_seconds,
+            last_summary_at=self.last_summary_at,
             has_result=self.latest_result is not None,
             is_favorite=self.is_favorite,
             favorite_updated_at=self.favorite_updated_at,
@@ -225,6 +307,7 @@ class VideoAssetRecord(BaseModel):
             folder_order=self.folder_order,
             global_pinned=self.global_pinned,
             folder_pinned=self.folder_pinned,
+            is_global_visible=self.is_global_visible,
             pages=self.pages,
             created_at=self.created_at,
             updated_at=self.updated_at,
@@ -243,12 +326,77 @@ class VideoProbeResponse(BaseModel):
     cached: bool = False
     requires_selection: bool = False
     pages: list[VideoPageOptionResponse] = Field(default_factory=list)
+    collection: VideoCollectionResponse | None = None
 
 
 class VideoLibraryResponse(BaseModel):
     videos: list[VideoAssetSummaryResponse] = Field(default_factory=list)
     folders: list[VideoFolderResponse] = Field(default_factory=list)
     preferences: VideoLibraryPreferencesResponse = Field(default_factory=VideoLibraryPreferencesResponse)
+    collections: list[VideoCollectionResponse] = Field(default_factory=list)
+
+
+class VideoCollectionSettingsRequest(BaseModel):
+    auto_check_on_open: bool | None = None
+    view_sort_mode: Literal[
+        "source",
+        "source_desc",
+        "recent_summary",
+        "recent_update",
+        "duration",
+        "custom",
+    ] | None = None
+    view_group_mode: Literal["none", "status", "source_section"] | None = None
+
+
+class VideoCollectionDeleteRequest(BaseModel):
+    mode: Literal["detach", "delete_contents"] = "detach"
+
+
+class VideoCollectionMoveRequest(BaseModel):
+    folder_id: str | None = None
+    folder_ids: list[str] | None = None
+
+
+class VideoCollectionFavoriteRequest(BaseModel):
+    is_favorite: bool
+
+
+class VideoCollectionPinRequest(BaseModel):
+    global_pinned: bool | None = None
+    folder_pinned: bool | None = None
+
+
+class VideoCollectionItemsRequest(BaseModel):
+    bvids: list[str] = Field(default_factory=list)
+
+
+class VideoCollectionItemsOrderRequest(BaseModel):
+    ordered_bvids: list[str] = Field(default_factory=list)
+
+
+class VideoCollectionTaskCreateRequest(BaseModel):
+    batch_id: str | None = Field(default=None, min_length=1, max_length=128)
+    ordered_video_ids: list[str] = Field(min_length=1)
+    visual_note_mode: str | None = None
+    prompt_preset_id: str | None = None
+    summary_scope: str | None = None
+
+
+class VideoCollectionTaskDispatchFailure(BaseModel):
+    task_id: str
+    video_id: str | None = None
+    error_code: str
+    error_message: str
+
+
+class VideoCollectionTaskCreateResponse(BaseModel):
+    batch_id: str
+    replayed: bool = False
+    created_tasks: list["TaskDetailResponse"] = Field(default_factory=list)
+    dispatch_failures: list[VideoCollectionTaskDispatchFailure] = Field(
+        default_factory=list
+    )
 
 
 class TaskSummaryResponse(BaseModel):
@@ -503,10 +651,111 @@ class KnowledgeChatHistoryItem(BaseModel):
     content: str
 
 
+class KnowledgeReference(BaseModel):
+    kind: Literal["video", "folder"]
+    id: str
+    label: str = ""
+
+
+class KnowledgeConversationSummary(BaseModel):
+    conversation_id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None = None
+    message_count: int = 0
+    preview: str = ""
+
+
+class KnowledgeConversationResponse(KnowledgeConversationSummary):
+    pass
+
+
+class KnowledgeConversationCreateRequest(BaseModel):
+    title: str | None = None
+
+
+class KnowledgeConversationUpdateRequest(BaseModel):
+    title: str
+
+
+class KnowledgeMessageResponse(BaseModel):
+    message_id: str
+    conversation_id: str
+    sequence: int
+    role: Literal["user", "assistant", "system"]
+    content: str = ""
+    reasoning: str = ""
+    status: str = "completed"
+    sources: list["KnowledgeSourceRef"] = Field(default_factory=list)
+    tools: list[dict[str, object]] = Field(default_factory=list)
+    references: list[KnowledgeReference] = Field(default_factory=list)
+    job_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeConversationMessagesResponse(BaseModel):
+    conversation_id: str
+    messages: list[KnowledgeMessageResponse] = Field(default_factory=list)
+
+
 class KnowledgeAskRequest(BaseModel):
     query: str
     context_limit: int = 5
     history: list[KnowledgeChatHistoryItem] = Field(default_factory=list)
+    references: list[KnowledgeReference] = Field(default_factory=list)
+
+
+class KnowledgeJobItemResponse(BaseModel):
+    task_id: str
+    video_id: str | None = None
+    title: str = ""
+    status: TaskStatus = TaskStatus.QUEUED
+    progress: int = 0
+    message: str = ""
+    error_message: str | None = None
+
+
+class KnowledgeJobResponse(BaseModel):
+    job_id: str
+    conversation_id: str
+    assistant_message_id: str
+    kind: str
+    status: str
+    query: str
+    progress: int = 0
+    error_message: str | None = None
+    items: list[KnowledgeJobItemResponse] = Field(default_factory=list)
+    agent_round: int = 1
+    agent_phase: str = "waiting_tasks"
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+
+
+class KnowledgeSuggestion(BaseModel):
+    text: str
+    reason: str = ""
+
+
+class KnowledgeSuggestionsResponse(BaseModel):
+    suggestions: list[KnowledgeSuggestion] = Field(default_factory=list)
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    based_on: list[str] = Field(default_factory=list)
+
+
+class KnowledgeReferenceItem(BaseModel):
+    kind: Literal["video", "folder"]
+    id: str
+    label: str
+    subtitle: str = ""
+    cover_url: str = ""
+    updated_at: datetime | None = None
+
+
+class KnowledgeReferencesResponse(BaseModel):
+    items: list[KnowledgeReferenceItem] = Field(default_factory=list)
 
 
 class KnowledgeSourceRef(BaseModel):
@@ -517,6 +766,9 @@ class KnowledgeSourceRef(BaseModel):
     video_title: str | None = None
     page_title: str | None = None
     page_number: int | None = None
+
+
+KnowledgeMessageResponse.model_rebuild()
 
 
 class KnowledgeAskResponse(BaseModel):

@@ -45,6 +45,7 @@ from video_sum_infra.runtime import (
     runtime_library_dirs,
     runtime_python_candidates,
     runtime_python_executable,
+    runtime_python_stdlib_healthy,
     runtime_pythonpath_dirs,
     runtime_site_packages_dir,
     sanitized_subprocess_dll_search,
@@ -93,6 +94,13 @@ _RUNTIME_ROOT_STALE_FILES: frozenset[str] = frozenset({"pyvenv.cfg"})
 _RUNTIME_REQUIREMENT_NAME_PATTERN = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)")
 _RUNTIME_CHANNEL_PATTERN = re.compile(r"^(base|gpu-cu\d+)$")
 _TORCH_FAMILY_PACKAGES: tuple[str, ...] = ("torch", "torchvision", "torchaudio")
+_PIP_REDIRECT_ENV_KEYS: tuple[str, ...] = (
+    "PIP_TARGET",
+    "PIP_PREFIX",
+    "PIP_USER",
+    "PYTHONUSERBASE",
+    "PIP_CONFIG_FILE",
+)
 
 
 def _knowledge_dependency_probe_fields(package: str) -> tuple[str, str, str]:
@@ -104,6 +112,38 @@ def _knowledge_dependency_probe_fields(package: str) -> tuple[str, str, str]:
     if normalized == "modelscope":
         return "modelscopeInstalled", "modelscopeBroken", "modelscopeError"
     return "", "", ""
+
+
+def _knowledge_package_site_package_dir_names(package: str) -> list[str]:
+    """Map a knowledge dependency distribution name to import dir names inside site-packages."""
+    normalized = str(package or "").strip().lower()
+    if normalized == "chromadb":
+        return ["chromadb"]
+    if normalized in {"sentence-transformers", "sentence_transformers"}:
+        return ["sentence_transformers"]
+    if normalized == "modelscope":
+        return ["modelscope"]
+    return []
+
+
+def packages_missing_from_site_packages(site_packages: Path, packages: list[str]) -> list[str]:
+    """Return the subset of *packages* whose import dir is absent from *site_packages*.
+
+    This is a directory-level check against the exact site-packages directory the
+    frozen service process puts on sys.path for the knowledge index. It complements
+    (and guards against) the subprocess probe, which imports packages through the
+    runtime interpreter and can accidentally pick them up from outside the managed
+    runtime (e.g. macOS user site-packages) — see issue #97.
+    """
+    missing: list[str] = []
+    for package in packages:
+        dir_names = _knowledge_package_site_package_dir_names(package)
+        if not dir_names:
+            # Unknown package mapping — do not block unknown providers.
+            continue
+        if not any((site_packages / dir_name).is_dir() for dir_name in dir_names):
+            missing.append(str(package))
+    return missing
 
 
 def apply_knowledge_dependency_policy(
@@ -226,7 +266,13 @@ def windows_hidden_subprocess_kwargs() -> dict[str, object]:
 
 def runtime_subprocess_env(runtime_channel: str) -> dict[str, str]:
     env = dict(os.environ)
-    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+    for key in (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONEXECUTABLE",
+        "__PYVENV_LAUNCHER__",
+        *_PIP_REDIRECT_ENV_KEYS,
+    ):
         env.pop(key, None)
     temp_dir = settings_manager.current.cache_dir / "runtime-temp" / runtime_channel
     try:
@@ -238,6 +284,13 @@ def runtime_subprocess_env(runtime_channel: str) -> dict[str, str]:
         logger.warning("failed to prepare runtime temp dir path=%s", temp_dir)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    # The frozen service process never loads the macOS user site-packages
+    # (~/Library/Python/3.12/lib/python/site-packages), while a normal runtime
+    # interpreter would. Disabling the user site keeps every runtime subprocess
+    # (probe / pip / worker) on the SAME package view as the service process,
+    # so a package that only exists in the user site can no longer be mistaken
+    # for an installed knowledge dependency (see issue #97).
+    env["PYTHONNOUSERSITE"] = "1"
     # Propagate HuggingFace mirror to subprocess (funasr / sentence-transformers)
     hf_endpoint = (settings_manager.current.hf_endpoint or "").strip()
     if hf_endpoint:
@@ -299,7 +352,13 @@ def run_command(command: list[str], runtime_channel: str, timeout: int = 3600) -
 
 def run_host_command(command: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
-    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+    for key in (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONEXECUTABLE",
+        "__PYVENV_LAUNCHER__",
+        *_PIP_REDIRECT_ENV_KEYS,
+    ):
         env.pop(key, None)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
@@ -422,8 +481,12 @@ def finish_install_session(session_id: str, success: bool) -> None:
 
 
 def append_install_log(session_id: str, line: str) -> None:
+    if not session_id:
+        # No streaming install session — nothing to append to.
+        return
     log = _install_log_path(session_id)
     sanitized = line.rstrip("\n\r") + "\n"
+    _ensure_install_log_dir()
     with log.open("a", encoding="utf-8") as f:
         f.write(sanitized)
     # Parse pip progress bar, e.g. " 45%|████     | 1.2G/2.7G [02:30<04:10, 11.0MB/s]"
@@ -897,6 +960,7 @@ def pip_install_with_fallbacks(
     reinstall: bool = False,
     timeout: int = 1800,
     runner=run_command,
+    install_target: Path | str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     attempts: list[tuple[str, subprocess.CalledProcessError]] = []
     session_id = _runner_install_session_id(runner)
@@ -907,6 +971,7 @@ def pip_install_with_fallbacks(
             str(python_executable),
             "-m",
             "pip",
+            "--isolated",
             "install",
             "--disable-pip-version-check",
             "--upgrade",
@@ -915,6 +980,12 @@ def pip_install_with_fallbacks(
         ]
         if reinstall:
             command.append("--force-reinstall")
+        if install_target is not None:
+            # Force packages (and their dependencies) into an explicit directory.
+            # Used when the runtime interpreter resolves a different site-packages
+            # than the one the frozen service process imports from (macOS portable
+            # runtime) — see install_knowledge_dependencies.
+            command.extend(["--target", str(install_target)])
         if index_url:
             command.extend(["--index-url", index_url])
         command.extend(packages)
@@ -948,6 +1019,53 @@ def pip_install_with_fallbacks(
             attempts.append((label, exc))
 
     raise HTTPException(status_code=500, detail=pip_install_error_detail(package_label, attempts))
+
+
+def _ensure_runtime_install_target(runtime_channel: str) -> Path:
+    """Return a writable, managed target for packages installed into a frozen runtime.
+
+    Relocatable Python distributions can retain the build-time ``sys.prefix`` or
+    ``purelib`` path (for example ``/install`` on macOS).  Allowing pip to use
+    that implicit path makes an otherwise healthy dependency download fail with
+    ``OSError: [Errno 30] Read-only file system``.  Keep installation scoped to
+    the user-writable managed runtime and fail before pip starts if it cannot be
+    written, so the UI reports the real repair path.
+    """
+    target = _assert_path_within_managed_runtime_root(
+        runtime_site_packages_dir(runtime_channel), field_name="runtime install target"
+    )
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".bilisum-install-write-test-",
+            dir=target,
+            delete=True,
+        ) as probe:
+            probe.write("ok")
+            probe.flush()
+    except OSError as exc:
+        logger.error(
+            "runtime dependency install target is not writable runtime_channel=%s target=%s error=%s",
+            _sanitize_for_log(runtime_channel),
+            _sanitize_for_log(str(target)),
+            _sanitize_for_log(str(exc)),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"知识库依赖安装目录不可写：{target}。"
+                "请检查应用数据目录权限，或同步/重建当前运行环境后重试。"
+                f" 原因：{exc}"
+            ),
+        ) from exc
+    logger.info(
+        "runtime dependency install target prepared runtime_channel=%s target=%s",
+        _sanitize_for_log(runtime_channel),
+        _sanitize_for_log(str(target)),
+    )
+    return target
 
 
 def _run_pip_install(
@@ -1198,7 +1316,14 @@ def ensure_runtime_channel(runtime_channel: str) -> Path | None:
 
     base_metadata = read_runtime_metadata(base_dir)
     target_metadata = read_runtime_metadata(target_dir)
-    target_ready = runtime_python_executable(runtime_channel) is not None
+    # "Ready" means more than python.exe existing: a portable runtime whose
+    # DLLs went missing (interrupted refresh) still passes the metadata check
+    # but fails every subprocess with "No module named '_socket'".  Treat it
+    # as not ready so the runtime gets re-synced from base / the seed below.
+    target_ready = (
+        runtime_python_executable(runtime_channel) is not None
+        and runtime_python_stdlib_healthy(target_dir)
+    )
     target_matches_base = runtime_metadata_matches_base(target_metadata, base_metadata)
     if target_ready and target_matches_base:
         _ensure_runtime_sitecustomize(runtime_channel)
@@ -1350,7 +1475,10 @@ def inspect_runtime_channels() -> dict[str, object]:
         metadata = read_runtime_metadata(runtime_dir)
         python_executable = runtime_python_executable(runtime_channel)
         exists = runtime_dir.exists()
-        ready = python_executable is not None
+        ready = (
+            python_executable is not None
+            and runtime_python_stdlib_healthy(runtime_dir)
+        )
         app_version = str(metadata.get("appVersion") or "")
         layout = str(metadata.get("runtimeLayout") or "")
         cached_environment = (
@@ -1978,6 +2106,8 @@ def build_worker(
         "llm_api_key": runtime_settings.llm_api_key,
         "llm_base_url": runtime_settings.llm_base_url,
         "llm_model": runtime_settings.llm_model,
+        "llm_thinking_type": runtime_settings.llm_thinking_type,
+        "llm_reasoning_effort": runtime_settings.llm_reasoning_effort,
         "visual_evidence_enabled": runtime_settings.visual_evidence_enabled,
         "visual_note_mode": runtime_settings.visual_note_mode,
         "visual_multimodal_enabled": runtime_settings.visual_multimodal_enabled,
@@ -1993,12 +2123,19 @@ def build_worker(
         "visual_evidence_image_quality": runtime_settings.visual_evidence_image_quality,
         "visual_evidence_timeout_seconds": runtime_settings.visual_evidence_timeout_seconds,
         "visual_evidence_retry_count": runtime_settings.visual_evidence_retry_count,
+        "twelvelabs_summary_enabled": runtime_settings.twelvelabs_summary_enabled,
+        "twelvelabs_api_key": runtime_settings.twelvelabs_api_key,
+        "twelvelabs_model": runtime_settings.twelvelabs_model,
+        "twelvelabs_base_url": runtime_settings.twelvelabs_base_url,
+        "twelvelabs_prompt": runtime_settings.twelvelabs_prompt,
         "visual_note_system_prompt": runtime_settings.visual_note_system_prompt,
         "visual_note_user_prompt_template": runtime_settings.visual_note_user_prompt_template,
         "visual_frame_planning_prompt": runtime_settings.visual_frame_planning_prompt,
         "visual_vlm_prompt": runtime_settings.visual_vlm_prompt,
         "summary_system_prompt": runtime_settings.summary_system_prompt,
         "summary_user_prompt_template": runtime_settings.summary_user_prompt_template,
+        "summary_context_mode": runtime_settings.summary_context_mode,
+        "summary_full_context_max_chars": runtime_settings.summary_full_context_max_chars,
         "knowledge_note_system_prompt": runtime_settings.knowledge_note_system_prompt,
         "knowledge_note_user_prompt_template": runtime_settings.knowledge_note_user_prompt_template,
         "mindmap_system_prompt": runtime_settings.mindmap_system_prompt,
@@ -2029,7 +2166,8 @@ def build_worker(
             else "disabled"
         ),
         knowledge_index_settings=current_settings,
-        task_concurrency=current_settings.task_concurrency,
+        transcription_concurrency=current_settings.transcription_concurrency,
+        llm_concurrency=current_settings.llm_concurrency,
         mindmap_concurrency=current_settings.mindmap_concurrency,
     )
 
@@ -2111,9 +2249,17 @@ def serialize_settings(
         "visual_evidence_image_quality": current_settings.visual_evidence_image_quality,
         "visual_evidence_timeout_seconds": current_settings.visual_evidence_timeout_seconds,
         "visual_evidence_retry_count": current_settings.visual_evidence_retry_count,
+        "twelvelabs_summary_enabled": current_settings.twelvelabs_summary_enabled,
+        "twelvelabs_api_key": "",
+        "twelvelabs_api_key_configured": bool(current_settings.twelvelabs_api_key),
+        "twelvelabs_model": current_settings.twelvelabs_model,
+        "twelvelabs_base_url": current_settings.twelvelabs_base_url,
+        "twelvelabs_prompt": current_settings.twelvelabs_prompt,
         "llm_provider": current_settings.llm_provider,
         "llm_base_url": current_settings.llm_base_url,
         "llm_model": current_settings.llm_model,
+        "llm_thinking_type": current_settings.llm_thinking_type,
+        "llm_reasoning_effort": current_settings.llm_reasoning_effort,
         "llm_api_key": "",
         "llm_api_key_configured": bool(current_settings.llm_api_key),
         "knowledge_llm_mode": current_settings.knowledge_llm_mode,
@@ -2134,6 +2280,8 @@ def serialize_settings(
         "knowledge_index_auto_rebuild": current_settings.knowledge_index_auto_rebuild,
         "summary_system_prompt": current_settings.summary_system_prompt,
         "summary_user_prompt_template": current_settings.summary_user_prompt_template,
+        "summary_context_mode": current_settings.summary_context_mode,
+        "summary_full_context_max_chars": current_settings.summary_full_context_max_chars,
         "knowledge_note_system_prompt": current_settings.knowledge_note_system_prompt,
         "knowledge_note_user_prompt_template": current_settings.knowledge_note_user_prompt_template,
         "visual_note_system_prompt": current_settings.visual_note_system_prompt,
@@ -2143,6 +2291,8 @@ def serialize_settings(
         "summary_chunk_target_chars": current_settings.summary_chunk_target_chars,
         "summary_chunk_overlap_segments": current_settings.summary_chunk_overlap_segments,
         "task_concurrency": current_settings.task_concurrency,
+        "transcription_concurrency": current_settings.transcription_concurrency,
+        "llm_concurrency": current_settings.llm_concurrency,
         "mindmap_concurrency": current_settings.mindmap_concurrency,
         "summary_chunk_concurrency": current_settings.summary_chunk_concurrency,
         "summary_chunk_retry_count": current_settings.summary_chunk_retry_count,
@@ -2271,7 +2421,13 @@ def install_local_asr(reinstall: bool, repository: SqliteTaskRepository, *, sess
         start_install_session(session_id, "本地 ASR")
     if use_streaming and use_current_python:
         host_env = dict(os.environ)
-        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+        for key in (
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONEXECUTABLE",
+            "__PYVENV_LAUNCHER__",
+            *_PIP_REDIRECT_ENV_KEYS,
+        ):
             host_env.pop(key, None)
         host_env["PYTHONIOENCODING"] = "utf-8"
         host_env["PYTHONUTF8"] = "1"
@@ -2393,7 +2549,13 @@ def install_funasr(reinstall: bool, repository: SqliteTaskRepository, *, session
         start_install_session(session_id, "FunASR")
     if use_streaming and use_current_python:
         host_env = dict(os.environ)
-        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+        for key in (
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONEXECUTABLE",
+            "__PYVENV_LAUNCHER__",
+            *_PIP_REDIRECT_ENV_KEYS,
+        ):
             host_env.pop(key, None)
         host_env["PYTHONIOENCODING"] = "utf-8"
         host_env["PYTHONUTF8"] = "1"
@@ -2553,12 +2715,26 @@ def install_knowledge_dependencies(
     if runtime_dir is None or python_executable is None:
         raise HTTPException(status_code=500, detail="Managed runtime is unavailable.")
 
+    # Never let a frozen/portable interpreter select its build-time pip target
+    # (commonly /install on macOS). The service imports dependencies from this
+    # exact directory, so the first install must use it instead of waiting for
+    # a post-install fallback that is never reached when pip hits errno 30.
+    install_target = None if use_current_python else _ensure_runtime_install_target(runtime_channel)
+
     use_streaming = session_id is not None
     if use_streaming:
         start_install_session(session_id, "知识库依赖")
+        if install_target is not None:
+            append_install_log(session_id, f"[知识库] pip 安装目标：{install_target}\n")
     if use_streaming and use_current_python:
         host_env = dict(os.environ)
-        for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+        for key in (
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PYTHONEXECUTABLE",
+            "__PYVENV_LAUNCHER__",
+            *_PIP_REDIRECT_ENV_KEYS,
+        ):
             host_env.pop(key, None)
         host_env["PYTHONIOENCODING"] = "utf-8"
         host_env["PYTHONUTF8"] = "1"
@@ -2573,7 +2749,19 @@ def install_knowledge_dependencies(
     environment = detect_environment(runtime_channel)
     if not reinstall:
         environment = apply_knowledge_dependency_policy(environment, provider)
-        if environment.get("knowledgeDependenciesReady"):
+        # The probe imports packages through the runtime interpreter, which can
+        # resolve them from outside the managed runtime (e.g. macOS user
+        # site-packages) — but the knowledge index imports them in-process from
+        # the runtime site-packages only. Only treat the dependencies as ready
+        # when they physically exist in that directory (issue #97).
+        missing_in_runtime = (
+            []
+            if use_current_python
+            else packages_missing_from_site_packages(
+                runtime_site_packages_dir(runtime_channel), required_packages
+            )
+        )
+        if environment.get("knowledgeDependenciesReady") and not missing_in_runtime:
             if use_streaming:
                 append_install_log(session_id, "知识库依赖已在当前运行环境可用，无需重复安装。")
                 finish_install_session(session_id, success=True)
@@ -2606,6 +2794,13 @@ def install_knowledge_dependencies(
                 "environment": environment,
                 "installSessionId": session_id,
             }, worker
+        if missing_in_runtime:
+            logger.warning(
+                "knowledge deps probe ready but missing from runtime site-packages "
+                "packages=%s runtime_channel=%s",
+                missing_in_runtime,
+                runtime_channel,
+            )
         repair_reinstall = bool(
             environment.get("chromadbVersion")
             or environment.get("sentenceTransformersVersion")
@@ -2667,6 +2862,7 @@ def install_knowledge_dependencies(
             reinstall=reinstall or repair_reinstall,
             timeout=1800,
             runner=pip_runner,
+            install_target=install_target,
         )
     except subprocess.CalledProcessError as exc:
         if isinstance(pip_runner, _StreamingRunner):
@@ -2685,6 +2881,74 @@ def install_knowledge_dependencies(
     activate_runtime_pythonpath(runtime_channel)
     clear_environment_probe_cache(runtime_channel)
     environment = apply_knowledge_dependency_policy(detect_environment(runtime_channel), provider)
+
+    # Directory-level verification: pip may have installed into a site-packages
+    # directory the runtime interpreter resolves on its own (e.g. the macOS
+    # portable runtime), NOT the one the frozen service process imports from.
+    # In that case reinstall explicitly into the managed runtime site-packages
+    # so the knowledge index can actually import the packages (issue #97).
+    missing_in_runtime = (
+        []
+        if use_current_python
+        else packages_missing_from_site_packages(
+            runtime_site_packages_dir(runtime_channel), required_packages
+        )
+    )
+    if missing_in_runtime:
+        append_install_log(
+            session_id,
+            "[知识库] pip 安装未落入运行环境 site-packages（"
+            + ", ".join(missing_in_runtime)
+            + "），正在改用 --target 强制安装到运行环境目录...\n",
+        )
+        try:
+            result = pip_install_with_fallbacks(
+                python_executable,
+                runtime_channel,
+                packages,
+                package_label="知识库依赖",
+                reinstall=False,
+                timeout=1800,
+                runner=pip_runner,
+                install_target=install_target,
+            )
+        except subprocess.CalledProcessError as exc:
+            if isinstance(pip_runner, _StreamingRunner):
+                pip_runner.cancel()
+                finish_install_session(session_id, success=False)
+            clear_environment_probe_cache(runtime_channel)
+            detail = (exc.stderr or exc.stdout or str(exc))[-1500:]
+            raise HTTPException(status_code=500, detail=detail) from exc
+        except HTTPException:
+            if isinstance(pip_runner, _StreamingRunner):
+                pip_runner.cancel()
+                finish_install_session(session_id, success=False)
+            clear_environment_probe_cache(runtime_channel)
+            raise
+        importlib.invalidate_caches()
+        clear_environment_probe_cache(runtime_channel)
+        environment = apply_knowledge_dependency_policy(
+            detect_environment(runtime_channel), provider
+        )
+        missing_in_runtime = (
+            []
+            if use_current_python
+            else packages_missing_from_site_packages(
+                runtime_site_packages_dir(runtime_channel), required_packages
+            )
+        )
+        if missing_in_runtime:
+            if use_streaming:
+                finish_install_session(session_id, success=False)
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "知识库依赖安装后仍未出现在运行环境 site-packages（"
+                    + ", ".join(missing_in_runtime)
+                    + "）。请到运行环境板块同步或重建当前 runtime 后重试。"
+                ),
+            )
+
     worker = (
         build_worker(repository, current_settings, environment_info=environment)
         if should_refresh_worker
@@ -2707,7 +2971,7 @@ def install_knowledge_dependencies(
             "knowledgeDependenciesReady": bool(environment.get("knowledgeDependenciesReady")),
         },
     )
-    installed = bool(environment.get("knowledgeDependenciesReady"))
+    installed = bool(environment.get("knowledgeDependenciesReady")) and not missing_in_runtime
     if use_streaming:
         finish_install_session(session_id, success=installed)
     return {

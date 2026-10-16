@@ -1,6 +1,63 @@
 ANTHROPIC_API_VERSION = "2023-06-01"
 
 
+def normalize_llm_thinking_type(value: str | None, default: str = "enabled") -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"enabled", "disabled"} else default
+
+
+def normalize_llm_reasoning_effort(value: str | None, default: str = "low") -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"low", "high", "max"} else default
+
+
+def apply_openai_reasoning_settings(
+    payload: dict[str, object],
+    *,
+    thinking_type: str | None,
+    reasoning_effort: str | None,
+    provider: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, object]:
+    """Add reasoning controls only for model families known to accept them.
+
+    The settings are exposed for OpenAI-compatible endpoints, but the request
+    fields are not part of the OpenAI-compatible contract. Sending them to an
+    arbitrary endpoint can turn an otherwise valid request into a 400. MiMo
+    is the currently supported model family; unknown providers/models keep
+    the original payload unchanged until their request schema is verified.
+
+    ``enable_thinking`` and ``chat_template_kwargs`` are legacy local-model
+    options. Gemini's strict OpenAI-compatible endpoint rejects these fields,
+    so they are removed at this boundary for Gemini requests while existing
+    non-Gemini compatibility behavior is preserved.
+    """
+    next_payload = dict(payload)
+    normalized_provider = str(provider or "").strip().lower().replace("_", "-")
+    normalized_model = normalize_openai_compatible_model_name(
+        str(model or next_payload.get("model") or "")
+    ).lower()
+    normalized_base_url = str(base_url or "").strip().lower()
+    normalized_model_for_match = normalized_model.removeprefix("models/")
+    is_gemini = (
+        normalized_model_for_match.startswith("gemini")
+        or "generativelanguage.googleapis.com" in normalized_base_url
+    )
+    if is_gemini:
+        next_payload.pop("enable_thinking", None)
+        next_payload.pop("chat_template_kwargs", None)
+    supports_controls = (
+        normalized_provider in {"mimo", "xiaomi-mimo"}
+        or normalized_model.startswith(("mimo-", "mimo_"))
+    )
+    if not supports_controls:
+        return next_payload
+    next_payload["thinking"] = {"type": normalize_llm_thinking_type(thinking_type)}
+    next_payload["reasoning_effort"] = normalize_llm_reasoning_effort(reasoning_effort)
+    return next_payload
+
+
 def normalize_openai_compatible_model_name(model: str) -> str:
     normalized = str(model or "").strip()
     if normalized.lower().startswith("mimo-"):
@@ -119,6 +176,12 @@ def extract_llm_message_content(body: object) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
 
+    output = body.get("output")
+    if isinstance(output, list):
+        output_text = extract_text_from_content_blocks(output)
+        if output_text:
+            return output_text
+
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices:
         return ""
@@ -142,6 +205,44 @@ def extract_llm_message_content(body: object) -> str:
     return ""
 
 
+def extract_llm_reasoning_content(body: object) -> str:
+    if not isinstance(body, dict):
+        return ""
+
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        first = choices[0]
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            value = first.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        message = first.get("message")
+        if isinstance(message, dict):
+            for key in ("reasoning_content", "reasoning", "thinking"):
+                value = message.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def extract_llm_finish_reason(body: object) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    value = body.get("finish_reason")
+    if isinstance(value, str):
+        return value
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        value = choices[0].get("finish_reason")
+        return value if isinstance(value, str) else None
+    return None
+
+
 def extract_text_from_content_blocks(content: object) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -154,6 +255,9 @@ def extract_text_from_content_blocks(content: object) -> str:
                 text_parts.append(item.strip())
             continue
         if not isinstance(item, dict):
+            continue
+        block_type = str(item.get("type") or "").strip().lower()
+        if block_type in {"thinking", "reasoning", "redacted_thinking"}:
             continue
         text = item.get("text")
         if isinstance(text, str) and text.strip():

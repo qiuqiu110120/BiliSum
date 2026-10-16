@@ -2,7 +2,7 @@ import "@xyflow/react/dist/style.css";
 import { Controls, Handle, Position, ReactFlow, type Edge, type Node as FlowNode, type NodeProps } from "@xyflow/react";
 import { toBlob } from "html-to-image";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type SVGProps } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { progressEventClass, stageLabel, taskStatusClass } from "../appModel";
 import { api } from "../api";
@@ -16,6 +16,7 @@ import {
   canExportKnowledgeNote,
   buildChapterGroups,
   buildKnowledgeCards,
+  buildTokenUsageMetrics,
   describeMindMapWorkspace,
   describeTaskContentState,
   describeUserFacingErrorMessage,
@@ -28,8 +29,9 @@ import {
   type DetailTab,
   type KnowledgeCard,
   type TaskPanelState,
+  type TokenUsageMetrics,
 } from "../detailModel";
-import type { MindMapNode, TaskDetail, TaskEvent, TaskMarkdownExportResponse, TaskMindMapResponse, TaskStatus, TaskSummary, TaskVisualEvidenceResponse, VideoAssetDetail, VideoPageBatchOption, VideoTaskBatchResponse, VisualEvidenceFrame, VisualEvidenceObservation } from "../types";
+import type { LlmUsageRecord, MindMapNode, TaskDetail, TaskEvent, TaskMarkdownExportResponse, TaskMindMapResponse, TaskResult, TaskStatus, TaskSummary, TaskVisualEvidenceResponse, VideoAssetDetail, VideoPageBatchOption, VideoTaskBatchResponse, VisualEvidenceFrame, VisualEvidenceObservation } from "../types";
 import { formatDateTime, formatDuration, formatTaskDuration, formatTokenCount, sanitizeMindMapLabel, summarizeEvents, taskStatusLabel } from "../utils";
 import { buildPlayerEmbedDescriptor, withPlayerSeek } from "../videoPlayer";
 
@@ -121,6 +123,146 @@ type FloatingPlayerLayout = {
 };
 
 type KnowledgeNoteViewMode = "text" | "visual";
+
+type TokenUsageTooltipProps = {
+  result?: Pick<
+    TaskResult,
+    | "llm_total_tokens"
+    | "llm_prompt_tokens"
+    | "llm_completion_tokens"
+    | "llm_prompt_cache_hit_tokens"
+    | "llm_prompt_cache_miss_tokens"
+    | "llm_prompt_cache_creation_tokens"
+    | "llm_usage_breakdown"
+  > | null;
+};
+
+function formatTokenMetric(value: number | null) {
+  return value == null ? "未提供" : `${formatTokenCount(value)} tokens`;
+}
+
+function formatCacheRate(value: number | null) {
+  return value == null ? "未提供" : `${(value * 100).toFixed(1)}%`;
+}
+
+function usageStageLabel(stage?: string) {
+  const labels: Record<string, string> = {
+    summary_full: "整段摘要",
+    summary_chunk: "摘要分块",
+    summary_merge: "摘要合并",
+    aggregate_summary: "全集摘要",
+    knowledge_note: "知识笔记",
+    visual_keyframe_plan: "图文取帧规划",
+    visual_frame: "视觉帧解析",
+    visual_note_compose: "图文笔记合成",
+    mindmap: "思维导图",
+    mindmap_repair: "思维导图修复",
+  };
+  return labels[stage || ""] || stage || "LLM 请求";
+}
+
+function formatUsageBreakdown(record: LlmUsageRecord) {
+  const total = formatTokenMetric(typeof record.total_tokens === "number" ? record.total_tokens : null);
+  const prompt = formatTokenMetric(typeof record.prompt_tokens === "number" ? record.prompt_tokens : null);
+  const cache = typeof record.cache_hit_tokens === "number"
+    ? `，命中 ${formatTokenMetric(record.cache_hit_tokens)}`
+    : "";
+  return `${usageStageLabel(record.stage)}：${total}（输入 ${prompt}${cache}）`;
+}
+
+const TOKEN_USAGE_TOOLTIP_CLOSE_DELAY = 280;
+
+function TokenUsageTooltip({ result }: TokenUsageTooltipProps) {
+  const [visible, setVisible] = useState(false);
+  const timerRef = useRef<number | null>(null);
+  const metrics: TokenUsageMetrics = buildTokenUsageMetrics(result);
+
+  const clearTimer = () => {
+    if (timerRef.current != null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  const showAfterDelay = () => {
+    clearTimer();
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      setVisible(true);
+    }, 520);
+  };
+
+  const keepVisible = () => {
+    clearTimer();
+    setVisible(true);
+  };
+
+  const hide = () => {
+    clearTimer();
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      setVisible(false);
+    }, TOKEN_USAGE_TOOLTIP_CLOSE_DELAY);
+  };
+
+  useEffect(() => () => clearTimer(), []);
+
+  return (
+    <span
+      className="detail-token-usage"
+      onMouseEnter={showAfterDelay}
+      onMouseLeave={hide}
+      onFocus={showAfterDelay}
+      onBlur={hide}
+    >
+      <button
+        className="detail-token-usage-trigger"
+        type="button"
+        aria-label="查看 Token 与缓存用量"
+        aria-describedby={visible ? "detail-token-usage-tooltip" : undefined}
+      >
+        {formatTokenCount(metrics.totalTokens)} tokens
+        <span aria-hidden="true" className="detail-token-usage-icon">ⓘ</span>
+      </button>
+      {visible ? (
+        <span
+          className="detail-token-usage-tooltip"
+          id="detail-token-usage-tooltip"
+          role="tooltip"
+          onMouseEnter={keepVisible}
+        >
+          <strong>Token 用量（API 统计）</strong>
+          <span>总计：{formatTokenMetric(metrics.totalTokens)}</span>
+          <span>输入：{formatTokenMetric(metrics.promptTokens)}</span>
+          <span>输出：{formatTokenMetric(metrics.completionTokens)}</span>
+          <span className="detail-token-usage-divider" />
+          {metrics.cacheReported ? (
+            <>
+              <span>缓存命中：{formatTokenMetric(metrics.cacheHitTokens)}</span>
+              <span>未命中/常规输入：{formatTokenMetric(metrics.cacheMissTokens)}</span>
+              <span>缓存创建：{formatTokenMetric(metrics.cacheCreationTokens)}</span>
+              <span>缓存命中率：{formatCacheRate(metrics.cacheHitRate)}</span>
+            </>
+          ) : (
+            <span>缓存用量：当前服务商未返回缓存字段</span>
+          )}
+          {metrics.breakdown.length ? (
+            <>
+              <span className="detail-token-usage-divider" />
+              <strong>分阶段明细</strong>
+              <span className="detail-token-usage-breakdown">
+                {metrics.breakdown.map((record, index) => (
+                  <span key={`${record.stage || "llm"}-${index}`}>{formatUsageBreakdown(record)}</span>
+                ))}
+              </span>
+            </>
+          ) : null}
+          <small>总计来自各请求响应中的 usage 汇总；已包含摘要、知识笔记、独立思维导图和图文笔记请求。服务商未返回 usage 的阶段会显示“未提供”。</small>
+        </span>
+      ) : null}
+    </span>
+  );
+}
 
 const MINDMAP_ROOT_ACCENT: MindMapAccent = {
   stroke: "#4c9fdd",
@@ -334,9 +476,32 @@ function isBilibiliCookieHelpError(message: string) {
   return /HTTP\s*412|cookies?\.txt|B\s*站返回|Bilibili rejected|风控拦截|登录态|cookiesfrombrowser|DPAPI/i.test(message);
 }
 
+function getVideoDetailBackPath(state: unknown) {
+  if (state && typeof state === "object" && "from" in state && typeof state.from === "string") {
+    const from = state.from.trim();
+    if (from.startsWith("/") && !from.startsWith("//")) {
+      return from;
+    }
+  }
+  return "/library";
+}
+
+function getVideoDetailBackLabel(path: string) {
+  if (path.startsWith("/collections/")) {
+    return "返回合集面板";
+  }
+  if (path === "/" || path.startsWith("/?")) {
+    return "返回首页";
+  }
+  return "返回视频库";
+}
+
 export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSettings, onOpenCookieTutorial, onCaptureLoginCookies }: VideoDetailPageProps) {
   const { videoId = "" } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
+  const backPath = getVideoDetailBackPath(location.state);
+  const backLabel = getVideoDetailBackLabel(backPath);
   const [video, setVideo] = useState<VideoAssetDetail | null>(null);
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [taskContexts, setTaskContexts] = useState<Record<string, TaskContext>>({});
@@ -1217,7 +1382,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
       ? "加载失败"
       : contentState
         ? taskStatusLabel(selectedTaskStatus)
-        : "已准备";
+        : null;
   const heroStats: HeroStat[] = [
     { id: "progress", label: "最新运行", value: heroProgressSummary },
     {
@@ -1683,9 +1848,9 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
 
       <div className="detail-page-shell">
         <div className="detail-page-toolbar">
-          <Link className="detail-back-button" to="/library">
+          <Link className="detail-back-button" to={backPath}>
             <IconChevronLeft className="detail-back-icon" />
-            返回视频库
+            {backLabel}
           </Link>
         </div>
 
@@ -2361,12 +2526,18 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
             <div className="detail-workspace-header">
               <h3 className="detail-workspace-label">Knowledge Workspace</h3>
               <div className="detail-workspace-meta">
-                <span className={`detail-workspace-signal ${contentState ? taskStatusClass(selectedTaskStatus) : "status-success"}`}>
-                  <span className="detail-workspace-signal-dot" />
-                  {workspaceStatusLabel}
-                </span>
+                {workspaceStatusLabel ? (
+                  <span className={`detail-workspace-signal ${contentState ? taskStatusClass(selectedTaskStatus) : "status-pending"}`}>
+                    <span className="detail-workspace-signal-dot" />
+                    {workspaceStatusLabel}
+                  </span>
+                ) : null}
                 {selectedTaskCode ? <span>任务 {selectedTaskCode}</span> : null}
-                {selectedTaskTokenCount != null ? <span>{formatTokenCount(selectedTaskTokenCount)} tokens</span> : null}
+                {selectedTaskTokenCount != null ? (
+                  <TokenUsageTooltip
+                    result={selectedResult ?? selectedTaskDetail?.result ?? { llm_total_tokens: selectedTaskTokenCount }}
+                  />
+                ) : null}
               </div>
             </div>
 
@@ -3677,7 +3848,7 @@ function TaskStatePanel({
 function DetailTabIcon({ active, tab }: { active: boolean; tab: DetailTab }) {
   const className = `detail-tab-icon ${active ? "is-active" : ""}`;
   if (tab === "knowledge") {
-    return <IconBrainCircuit className={className} />;
+    return <IconKnowledgeCard className={className} />;
   }
   if (tab === "summary") {
     return <IconFileText className={className} />;
@@ -3826,6 +3997,15 @@ function IconCopyImage(props: SVGProps<SVGSVGElement>) {
       <path d="m6.5 16.5 3.4-3.4a1.3 1.3 0 0 1 1.84 0l1.26 1.26" />
       <path d="m12.5 15.5 1.4-1.4a1.3 1.3 0 0 1 1.84 0l.76.76" />
       <circle cx="11" cy="10.5" r="1.1" />
+    </svg>
+  );
+}
+
+function IconKnowledgeCard(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24" {...props}>
+      <rect x="4.5" y="3.5" width="15" height="17" rx="2.5" />
+      <path d="M8 9h8M8 12.5h8M8 16h5" />
     </svg>
   );
 }

@@ -1,18 +1,21 @@
 {
   "name": "bilisum",
-  "version": "1.19.1",
-  "description": "Start the local BiliSum service from npx.",
+  "version": "1.21.1",
+  "description": "BiliSum CLI: control the installed BiliSum app, or run standalone with its own runtime.",
   "bin": {
     "bilisum": "bin/bilisum.js"
   },
   "files": [
     "bin",
+    "lib",
     "runtime",
+    "skill",
     "README.md"
   ],
   "scripts": {
     "prepack": "node scripts/prepare-runtime.js",
-    "postpack": "node scripts/cleanup-runtime.js"
+    "postpack": "node scripts/cleanup-runtime.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"

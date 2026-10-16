@@ -143,7 +143,11 @@ def test_serialize_settings_includes_persisted_file_flag(monkeypatch, tmp_path: 
     payload = serialize_settings(current, environment_info={"cudaAvailable": False, "runtimeChannel": "base"})
 
     assert payload["settings_file_exists"] is False
+    assert payload["llm_thinking_type"] == current.llm_thinking_type == "enabled"
+    assert payload["llm_reasoning_effort"] == current.llm_reasoning_effort == "low"
     assert payload["task_concurrency"] == current.task_concurrency
+    assert payload["transcription_concurrency"] == current.transcription_concurrency
+    assert payload["llm_concurrency"] == current.llm_concurrency
     assert payload["mindmap_concurrency"] == current.mindmap_concurrency
     assert payload["knowledge_note_system_prompt"] == current.knowledge_note_system_prompt
     assert payload["knowledge_note_user_prompt_template"] == current.knowledge_note_user_prompt_template
@@ -459,6 +463,11 @@ def test_install_knowledge_dependencies_refreshes_environment(monkeypatch, tmp_p
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
     monkeypatch.setattr(
         runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
+    monkeypatch.setattr(
+        runtime_support,
         "detect_environment",
         lambda runtime_channel=None: {
             "runtimeChannel": runtime_channel or "base",
@@ -678,6 +687,11 @@ def test_siliconflow_knowledge_dependencies_only_install_chromadb(monkeypatch, t
     monkeypatch.setattr(runtime_support, "ensure_runtime_pip", lambda python_executable, runtime_channel: None)
     monkeypatch.setattr(runtime_support, "activate_runtime_pythonpath", lambda runtime_channel: None)
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
+    monkeypatch.setattr(
+        runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
     monkeypatch.setattr(runtime_support, "write_runtime_metadata", lambda runtime_channel, payload: None)
 
     commands: list[tuple[list[str], bool]] = []
@@ -746,6 +760,11 @@ def test_install_knowledge_dependencies_repairs_broken_imports(monkeypatch, tmp_
     monkeypatch.setattr(runtime_support, "ensure_runtime_pip", lambda python_executable, runtime_channel: None)
     monkeypatch.setattr(runtime_support, "activate_runtime_pythonpath", lambda runtime_channel: None)
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
+    monkeypatch.setattr(
+        runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
     monkeypatch.setattr(runtime_support, "write_runtime_metadata", lambda runtime_channel, payload: None)
 
     commands: list[tuple[list[str], bool]] = []
@@ -817,6 +836,11 @@ def test_install_knowledge_dependencies_auto_uninstalls_broken_sentence_transfor
     monkeypatch.setattr(runtime_support, "ensure_runtime_pip", lambda python_executable, runtime_channel: None)
     monkeypatch.setattr(runtime_support, "activate_runtime_pythonpath", lambda runtime_channel: None)
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
+    monkeypatch.setattr(
+        runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
     monkeypatch.setattr(runtime_support, "write_runtime_metadata", lambda runtime_channel, payload: None)
 
     pip_commands: list[tuple[list[str], bool]] = []
@@ -906,6 +930,11 @@ def test_install_knowledge_dependencies_auto_uninstall_failure_non_fatal(
     monkeypatch.setattr(runtime_support, "ensure_runtime_pip", lambda python_executable, runtime_channel: None)
     monkeypatch.setattr(runtime_support, "activate_runtime_pythonpath", lambda runtime_channel: None)
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
+    monkeypatch.setattr(
+        runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
     monkeypatch.setattr(runtime_support, "write_runtime_metadata", lambda runtime_channel, payload: None)
 
     import logging
@@ -1005,6 +1034,11 @@ def test_install_knowledge_dependencies_no_auto_uninstall_when_required(
     monkeypatch.setattr(runtime_support, "ensure_runtime_pip", lambda python_executable, runtime_channel: None)
     monkeypatch.setattr(runtime_support, "activate_runtime_pythonpath", lambda runtime_channel: None)
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
+    monkeypatch.setattr(
+        runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
     monkeypatch.setattr(runtime_support, "write_runtime_metadata", lambda runtime_channel, payload: None)
 
     run_commands: list[list[str]] = []
@@ -1081,6 +1115,11 @@ def test_install_knowledge_dependencies_can_target_runtime_channel(monkeypatch, 
     monkeypatch.setattr(runtime_support, "ensure_runtime_pip", lambda python_executable, runtime_channel: None)
     monkeypatch.setattr(runtime_support, "activate_runtime_pythonpath", lambda runtime_channel: None)
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
+    monkeypatch.setattr(
+        runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
     monkeypatch.setattr(runtime_support, "write_runtime_metadata", lambda runtime_channel, payload: None)
     monkeypatch.setattr(
         runtime_support,
@@ -1129,6 +1168,11 @@ def test_install_knowledge_dependencies_refreshes_worker_for_saved_runtime_chann
     monkeypatch.setattr(runtime_support, "ensure_runtime_pip", lambda python_executable, runtime_channel: None)
     monkeypatch.setattr(runtime_support, "activate_runtime_pythonpath", lambda runtime_channel: None)
     monkeypatch.setattr(runtime_support, "clear_environment_probe_cache", lambda runtime_channel=None: None)
+    monkeypatch.setattr(
+        runtime_support,
+        "packages_missing_from_site_packages",
+        lambda site_packages, packages: [],
+    )
     monkeypatch.setattr(runtime_support, "write_runtime_metadata", lambda runtime_channel, payload: None)
     monkeypatch.setattr(
         runtime_support,
@@ -2845,6 +2889,8 @@ def test_llm_connection_normalizes_mimo_model_and_requests_json_mode(monkeypatch
     assert response["model"] == "MiMo-V2.5-Pro"
     assert calls[0]["json"]["model"] == "mimo-v2.5-pro"
     assert calls[0]["json"]["max_tokens"] == 512
+    assert calls[0]["json"]["thinking"] == {"type": "enabled"}
+    assert calls[0]["json"]["reasoning_effort"] == "low"
 
 
 def test_llm_connection_accepts_choice_text_response(monkeypatch, tmp_path: Path) -> None:
@@ -3354,3 +3400,67 @@ def test_detect_environment_reads_probe_script(monkeypatch, tmp_path: Path) -> N
     # The command should include the probe script content, not a FileNotFoundError
     assert environment.get("pythonVersion"), "probe returned no pythonVersion"
     assert environment.get("torchInstalled") is not None, "probe returned no torchInstalled"
+
+
+def test_ensure_runtime_channel_repairs_broken_stdlib(monkeypatch, tmp_path: Path) -> None:
+    """A target runtime whose DLLs went missing (python.exe + matching metadata
+    still present) must be treated as not-ready and rebuilt from base instead of
+    being accepted as healthy — this is what previously produced the endless
+    ``No module named '_socket'`` probe failures."""
+    import video_sum_service.runtime_support as rs
+
+    runtime_root = tmp_path / "runtime"
+    base_dir = runtime_root / "base"
+    gpu_dir = runtime_root / "gpu-cu128"
+    (base_dir / "DLLs").mkdir(parents=True)
+    (base_dir / "DLLs" / "_socket.pyd").write_text("base-socket", encoding="utf-8")
+    (base_dir / "Lib" / "site-packages").mkdir(parents=True)
+    (gpu_dir / "DLLs").mkdir(parents=True)  # broken: empty DLLs
+    (gpu_dir / "Lib" / "site-packages").mkdir(parents=True)
+    (base_dir / "python.exe").write_text("base-python", encoding="utf-8")
+    (gpu_dir / "python.exe").write_text("gpu-python", encoding="utf-8")
+    base_metadata = (
+        '{"runtimeChannel":"base","runtimeLayout":"portable-cpython",'
+        '"appVersion":"1.20.0","pythonVersion":"3.12.10"}'
+    )
+    (base_dir / "video_sum_runtime.json").write_text(base_metadata, encoding="utf-8")
+    (gpu_dir / "video_sum_runtime.json").write_text(
+        '{"runtimeChannel":"gpu-cu128","runtimeLayout":"portable-cpython","appVersion":"1.20.0","pythonVersion":"3.12.10"}',
+        encoding="utf-8",
+    )
+    (gpu_dir / "python312._pth").write_text(
+        "DLLs\nstdlib\nLib\\site-packages\nimport site\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(rs, "managed_runtime_dir", lambda channel: runtime_root / channel)
+    monkeypatch.setattr(
+        rs,
+        "runtime_python_executable",
+        lambda channel: (runtime_root / channel / "python.exe")
+        if (runtime_root / channel / "python.exe").exists()
+        else None,
+    )
+    # The fake gpu runtime is a portable layout (python312._pth lists DLLs)
+    # with an EMPTY DLLs dir, so the real stdlib health check reports
+    # not-ready — python.exe + matching metadata alone must not count as ready.
+    monkeypatch.setattr(rs, "_ensure_runtime_sitecustomize", lambda channel: None)
+
+    replace_calls: list[str] = []
+    monkeypatch.setattr(
+        rs,
+        "replace_runtime_with_base_copy",
+        lambda target_dir, base_dir_arg, runtime_channel, backup_dir: (
+            replace_calls.append(runtime_channel)
+        ),
+    )
+    monkeypatch.setattr(
+        rs,
+        "run_runtime_refresh_with_backup",
+        lambda target_dir, backup_dir, refresh: refresh(),
+    )
+
+    result = rs.ensure_runtime_channel("gpu-cu128")
+
+    assert replace_calls == ["gpu-cu128"], "broken runtime should be rebuilt from base"
+    assert result == gpu_dir

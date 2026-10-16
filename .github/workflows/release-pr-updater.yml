@@ -1,0 +1,121 @@
+name: Release PR Updater
+
+# 在「Release vX.Y.Z」PR 上通过 label 选择版本类型：
+#   - 添加 label release:beta / release:rc / release:alpha → 生成开发版版本号
+#     （vX.Y.Z-beta.1，重复添加递增）并同步 PR 标题与分支版本文件
+#
+# 注意：
+# - 只监听 labeled（添加 label）事件。移除 label 的 unlabeled 事件会与
+#   labeled 事件并发竞争（把分支版本恢复成 stable 后又被改回），故不处理；
+#   移除 label 后版本保持 prerelease，需要恢复发行版时手动改回标题与版本。
+# - 使用 pull_request_target 而非 pull_request —— 由 workflow 自动创建
+#   的 Release PR 上，pull_request 的 labeled 事件不会触发 workflow，
+#   pull_request_target 则正常触发（checkout 只针对仓库自己的 release 分支）。
+
+on:
+  pull_request_target:
+    types:
+      - labeled
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-pr-updater-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  update-release-pr:
+    if: ${{ startsWith(github.event.pull_request.title, 'Release v') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out release PR branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Decide target version from labels
+        id: decide
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh pr view "$PR_NUMBER" --json title,labels)"
+          current="$(printf '%s' "$pr_json" | python -c "import json,sys; print(json.load(sys.stdin)['title'].replace('Release v','').strip())")"
+          label_names="$(printf '%s' "$pr_json" | python -c "import json,sys; print(' '.join(l['name'] for l in json.load(sys.stdin)['labels']))")"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "labels=$label_names" >> "$GITHUB_OUTPUT"
+
+          kind=""
+          for candidate in beta rc alpha; do
+            if printf '%s' "$label_names" | grep -q "release:${candidate}"; then
+              kind="$candidate"
+              break
+            fi
+          done
+          echo "kind=${kind}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "${kind}" ]; then
+            # An unrelated label (e.g. bug) was added — leave the release PR as-is.
+            echo "No release kind label present; nothing to update."
+            echo "target=${current}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Compute the target version WITHOUT writing any files: bump_version.py
+          # (the CLI) also calls sync_version and would mutate the checkout,
+          # which breaks the "already synced" check in the next step.
+          target="$(python -c "import sys; sys.path.insert(0, 'scripts'); from versioning import bump_version, read_source_version; print(bump_version(read_source_version(), '${kind}'))")"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync version files on the PR branch
+        if: ${{ steps.decide.outputs.kind != '' }}
+        env:
+          TARGET: ${{ steps.decide.outputs.target }}
+          CURRENT: ${{ steps.decide.outputs.current }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git"
+
+          current_file="$(cat VERSION | tr -d '[:space:]')"
+          if [ "${current_file}" = "${TARGET}" ]; then
+            echo "Version files already at ${TARGET}; nothing to commit."
+            exit 0
+          fi
+          python scripts/bump_version.py "${TARGET}"
+          git add VERSION pyproject.toml apps/service/pyproject.toml \
+            packages/core/pyproject.toml packages/infra/pyproject.toml \
+            apps/desktop/package.json apps/desktop/package-lock.json \
+            packages/npx/package.json packages/npx/package-lock.json
+          git commit -m "chore(release): v${TARGET} [skip ci]"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+
+      - name: Update pull request title
+        if: ${{ steps.decide.outputs.kind != '' }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TARGET: ${{ steps.decide.outputs.target }}
+          CURRENT: ${{ steps.decide.outputs.current }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${CURRENT}" = "${TARGET}" ]; then
+            echo "PR title already reflects v${TARGET}."
+            exit 0
+          fi
+          # Use the REST API (not `gh pr edit`, which requires a GraphQL scope
+          # the PAT_TOKEN lacks) to rename the release PR.
+          gh api -X PATCH "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+            -f title="Release v${TARGET}" >/dev/null
+

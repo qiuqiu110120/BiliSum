@@ -6,7 +6,8 @@ import { platformLabel } from "../appModel";
 import { LinkIcon, LocalVideoIcon } from "../components/AppIcons";
 import { FloatingNoticeStack } from "../components/FloatingNoticeStack";
 import { VideoCard } from "../components/VideoCard";
-import type { PromptPreset, VideoAssetSummary } from "../types";
+import { CollectionCard } from "../components/CollectionCard";
+import type { PromptPreset, VideoAssetSummary, VideoCollection } from "../types";
 import { formatDuration } from "../utils";
 
 type HomePageProps = {
@@ -25,10 +26,15 @@ type HomePageProps = {
   onOpenSetupAssistant(issueKey?: string): void;
   onOpenConfigIssue(issueKey: string): void;
   onEditPromptPreset(presetId: string): void;
-  favoriteVideos: VideoAssetSummary[];
-  recentVideos: VideoAssetSummary[];
+  favoriteItems: HomeSectionItem[];
+  recentItems: HomeSectionItem[];
   onToggleFavorite(videoId: string, nextFavorite: boolean): Promise<void>;
+  onToggleCollectionFavorite(collectionId: string, nextFavorite: boolean): Promise<unknown>;
 };
+
+type HomeSectionItem =
+  | { kind: "video"; video: VideoAssetSummary }
+  | { kind: "collection"; collection: VideoCollection };
 
 type SummaryPreference = {
   noteMode: "text" | "visual";
@@ -130,9 +136,10 @@ export function HomePage({
   onOpenSetupAssistant,
   onOpenConfigIssue,
   onEditPromptPreset,
-  favoriteVideos,
-  recentVideos,
+  favoriteItems,
+  recentItems,
   onToggleFavorite,
+  onToggleCollectionFavorite,
 }: HomePageProps) {
   const preferenceMenuRef = useRef<HTMLDivElement | null>(null);
   const promptMenuRef = useRef<HTMLDivElement | null>(null);
@@ -148,6 +155,7 @@ export function HomePage({
   const [hiddenPromptPresetIds, setHiddenPromptPresetIds] = useState<Set<string>>(() => loadHiddenPromptPresetIds());
   const [promptPresetId, setPromptPresetId] = useState(() => loadPromptPresetId());
   const [promptContextMenu, setPromptContextMenu] = useState<{ x: number; y: number; presetId: string } | null>(null);
+  const [promptSelectOpen, setPromptSelectOpen] = useState(false);
   const [promptLoading, setPromptLoading] = useState(false);
   const [promptStatus, setPromptStatus] = useState("");
   const [promptModeSaving, setPromptModeSaving] = useState(false);
@@ -219,12 +227,19 @@ export function HomePage({
 
   useEffect(() => {
     if (!preferenceMenuOpen) {
+      setPromptSelectOpen(false);
       return;
     }
 
     function handlePointerDown(event: globalThis.MouseEvent) {
       const target = event.target as Node;
-      if (preferenceMenuRef.current?.contains(target) || promptMenuRef.current?.contains(target)) {
+      if (preferenceMenuRef.current?.contains(target)) {
+        if (!(target instanceof Element) || !target.closest(".home-prompt-select-shell")) {
+          setPromptSelectOpen(false);
+        }
+        return;
+      }
+      if (promptMenuRef.current?.contains(target)) {
         return;
       }
       setPreferenceMenuOpen(false);
@@ -232,6 +247,7 @@ export function HomePage({
 
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
+        setPromptSelectOpen(false);
         setPreferenceMenuOpen(false);
       }
     }
@@ -284,6 +300,7 @@ export function HomePage({
     setPromptPresetId(nextPresetId || "general");
     setPromptStatus("");
     setPromptContextMenu(null);
+    setPromptSelectOpen(false);
   }
 
   function openPromptContextMenu(event: MouseEvent<HTMLElement>) {
@@ -588,20 +605,36 @@ export function HomePage({
                       </button>
                     </div>
                     <div className="home-prompt-select-shell">
-                      <select
+                      <button
                         className="select-field home-prompt-select"
+                        type="button"
+                        role="combobox"
                         aria-label="选择摘要 Prompt"
-                        value={selectedPrompt?.id || promptPresetId}
+                        aria-expanded={promptSelectOpen}
+                        aria-controls="summary-prompt-options"
                         disabled={promptRouterMode === "auto" || promptLoading || !selectablePromptPresets.length}
-                        onChange={(event) => updatePromptPreset(event.target.value)}
+                        onClick={() => setPromptSelectOpen((open) => !open)}
                       >
-                        {selectablePromptPresets.map((preset) => (
-                          <option key={preset.id} value={preset.id}>
-                            {preset.name}
-                          </option>
-                        ))}
-                      </select>
-                      <IconChevronDown />
+                        <span>{selectedPrompt?.name || "暂无可用 Prompt"}</span>
+                        <IconChevronDown />
+                      </button>
+                      {promptSelectOpen && selectablePromptPresets.length ? (
+                        <div className="home-prompt-options" id="summary-prompt-options" role="listbox" aria-label="摘要 Prompt 选项">
+                          {selectablePromptPresets.map((preset) => (
+                            <button
+                              key={preset.id}
+                              className={`home-prompt-option ${preset.id === selectedPrompt?.id ? "is-selected" : ""}`}
+                              type="button"
+                              role="option"
+                              aria-selected={preset.id === selectedPrompt?.id}
+                              onClick={() => updatePromptPreset(preset.id)}
+                            >
+                              <span>{preset.name}</span>
+                              {preset.id === selectedPrompt?.id ? <span aria-hidden="true">✓</span> : null}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                     {selectedPrompt?.description ? (
                       <span className="home-prompt-description">{selectedPrompt.description}</span>
@@ -647,7 +680,12 @@ export function HomePage({
             </div>
           </div>
         ) : null}
-        {promptStatus ? <div className="detail-error-banner" role="status">{promptStatus}</div> : null}
+        {promptStatus ? (
+          <div className="home-prompt-status is-error" role="status">
+            <span className="home-prompt-status-dot" aria-hidden="true" />
+            <span>{promptStatus}</span>
+          </div>
+        ) : null}
 
         {configHealth.checked && !configHealth.isConfigured ? (
           <article className={`config-alert-card tone-${configHealth.state}`}>
@@ -678,32 +716,35 @@ export function HomePage({
 
         {probePreview && (
           <article className="probe-preview">
-            <img src={probePreview.cover_url} alt={probePreview.title} />
+            {probePreview.cover_url ? <img src={probePreview.cover_url} alt={probePreview.title} /> : <div className="probe-preview-placeholder" aria-hidden="true">VIDEO</div>}
             <div className="probe-preview-copy">
               <span className="section-kicker">即将加入视频库</span>
               <strong>{probePreview.title}</strong>
               <small>{formatDuration(probePreview.duration)} · {platformLabel(probePreview.platform)}</small>
+              <small>如果检测到合集，合集卡片会保留在视频库中，展开后再管理内部视频。</small>
             </div>
           </article>
         )}
       </div>
 
-      {favoriteVideos.length > 0 ? (
+      {favoriteItems.length > 0 ? (
         <div className="section">
           <VideoSection
             title="收藏视频"
-            videos={favoriteVideos}
+            items={favoriteItems}
             onToggleFavorite={onToggleFavorite}
+            onToggleCollectionFavorite={onToggleCollectionFavorite}
           />
         </div>
       ) : null}
 
       <div className="section">
-        {recentVideos.length > 0 ? (
+        {recentItems.length > 0 ? (
           <VideoSection
             title="最近视频"
-            videos={recentVideos}
+            items={recentItems}
             onToggleFavorite={onToggleFavorite}
+            onToggleCollectionFavorite={onToggleCollectionFavorite}
           />
         ) : (
           <div className="empty-placeholder">
@@ -725,21 +766,23 @@ function IconChevronDown() {
 
 function VideoSection({
   title,
-  videos,
+  items,
   onToggleFavorite,
+  onToggleCollectionFavorite,
 }: {
   title: string;
-  videos: VideoAssetSummary[];
+  items: HomeSectionItem[];
   onToggleFavorite(videoId: string, nextFavorite: boolean): Promise<void>;
+  onToggleCollectionFavorite(collectionId: string, nextFavorite: boolean): Promise<unknown>;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
-  const [canScrollRight, setCanScrollRight] = useState(videos.length > 1);
+  const [canScrollRight, setCanScrollRight] = useState(items.length > 1);
   const [isScrollable, setIsScrollable] = useState(false);
   const [cardsPerView, setCardsPerView] = useState(() => getCardsPerView(typeof window === "undefined" ? 1180 : window.innerWidth));
   const [cardWidth, setCardWidth] = useState(0);
   const pageStep = Math.max(1, cardsPerView * (cardWidth + 16));
-  const totalPages = Math.max(1, Math.ceil(videos.length / Math.max(1, cardsPerView)));
+  const totalPages = Math.max(1, Math.ceil(items.length / Math.max(1, cardsPerView)));
   const currentPage = isScrollable && cardWidth > 0
     ? Math.min(totalPages, Math.max(1, Math.round((viewportRef.current?.scrollLeft ?? 0) / pageStep) + 1))
     : 1;
@@ -761,9 +804,9 @@ function VideoSection({
     const viewport = viewportRef.current;
     if (!viewport) {
       setCardsPerView(getCardsPerView(typeof window === "undefined" ? 1180 : window.innerWidth));
-      setIsScrollable(videos.length > 1);
+      setIsScrollable(items.length > 1);
       setCanScrollLeft(false);
-      setCanScrollRight(videos.length > 1);
+      setCanScrollRight(items.length > 1);
       return;
     }
 
@@ -801,7 +844,7 @@ function VideoSection({
       window.removeEventListener("resize", handleResize);
       resizeObserver?.disconnect();
     };
-  }, [videos.length]);
+  }, [items.length]);
 
   function scrollByPage(direction: "left" | "right") {
     const viewport = viewportRef.current;
@@ -825,24 +868,23 @@ function VideoSection({
       <div className="home-carousel-head">
         <h2 className="section-title home-carousel-title">{title}</h2>
         <div className="home-carousel-controls">
-          <span className="helper-chip">{videos.length} 个视频</span>
+          <span className="helper-chip">{items.length} 个条目</span>
         </div>
       </div>
 
-      {videos.length > 0 ? (
+      {items.length > 0 ? (
         <div className="home-carousel-shell">
           <div className="home-carousel-stage" ref={viewportRef}>
             <div className="home-carousel-track">
-              {videos.map((video) => (
+              {items.map((item) => (
                 <div
                   className="home-carousel-item"
-                  key={video.video_id}
+                  key={item.kind === "video" ? item.video.video_id : `collection:${item.collection.collection_id}`}
                   style={cardWidth > 0 ? ({ width: `${cardWidth}px`, flexBasis: `${cardWidth}px` } as CSSProperties) : undefined}
                 >
-                  <VideoCard
-                    video={video}
-                    onToggleFavorite={onToggleFavorite}
-                  />
+                  {item.kind === "video" ? (
+                    <VideoCard video={item.video} onToggleFavorite={onToggleFavorite} />
+                  ) : <CollectionCard collection={item.collection} onToggleFavorite={onToggleCollectionFavorite} />}
                 </div>
               ))}
             </div>

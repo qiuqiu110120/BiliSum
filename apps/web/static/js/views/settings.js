@@ -237,6 +237,12 @@ export function renderSettingsView(state) {
               { value: "rule", label: "规则摘要" },
               { value: "llm", label: "LLM 摘要" }
             ])}
+            ${renderSelect("summary_context_mode", "摘要上下文模式", settings.summary_context_mode || "auto", [
+              { value: "auto", label: "自动：短字幕整段，长字幕分块" },
+              { value: "full", label: "整段：强制发送完整字幕" },
+              { value: "chunked", label: "分块：保持原有流程" }
+            ])}
+            ${renderInput("summary_full_context_max_chars", "自动整段上限字符数", settings.summary_full_context_max_chars || 18000, "number", "18000")}
             <label class="toggle-row">
               <span>启用 LLM 摘要</span>
               <input id="llm_enabled" type="checkbox" ${settings.llm_enabled ? "checked" : ""} />
@@ -251,6 +257,19 @@ export function renderSettingsView(state) {
             ${renderInput("summary_chunk_retry_count", "单块重试次数", settings.summary_chunk_retry_count || 2, "number", "2")}
             ${renderTextarea("summary_system_prompt", "系统提示词", settings.summary_system_prompt || "", 4)}
             ${renderTextarea("summary_user_prompt_template", "用户提示词模板", settings.summary_user_prompt_template || "", 6)}
+          </section>
+
+          <!-- Twelve Labs Pegasus 视频理解（可选） -->
+          <section class="settings-subsection">
+            <h3>Twelve Labs Pegasus 视频理解</h3>
+            <label class="toggle-row">
+              <span>启用 Pegasus 视频摘要（仅本地视频，写入知识笔记）</span>
+              <input id="twelvelabs_summary_enabled" type="checkbox" ${settings.twelvelabs_summary_enabled ? "checked" : ""} />
+            </label>
+            ${renderInput("twelvelabs_api_key", "Twelve Labs API Key", settings.twelvelabs_api_key || "", "password", "tlk_...", "current-password")}
+            ${renderInput("twelvelabs_model", "Pegasus 模型", settings.twelvelabs_model || "pegasus1.5", "text", "pegasus1.5")}
+            ${renderInput("twelvelabs_base_url", "API Base URL", settings.twelvelabs_base_url || "", "text", "https://api.twelvelabs.io/v1.3")}
+            ${renderTextarea("twelvelabs_prompt", "Pegasus 提示词（留空用默认）", settings.twelvelabs_prompt || "", 4)}
           </section>
 
           <!-- 知识库 LLM -->
@@ -332,6 +351,8 @@ export function renderSettingsView(state) {
           ${renderRow("摘要模式", settings.summary_mode || "-", "neutral")}
           ${renderRow("分块大小", String(settings.summary_chunk_target_chars || "-"), "neutral")}
           ${renderRow("分块并发", String(settings.summary_chunk_concurrency || "-"), "neutral")}
+          ${renderRow("Pegasus 视频理解", settings.twelvelabs_summary_enabled ? "✓ 已启用" : "✗ 关闭", settings.twelvelabs_summary_enabled ? "success" : "neutral")}
+          ${renderRow("Twelve Labs API Key", settings.twelvelabs_api_key_configured ? "✓ 已配置" : "✗ 未配置", settings.twelvelabs_api_key_configured ? "success" : "warning")}
           ${renderRow("API Key", settings.llm_api_key_configured ? "✓ 已配置" : "✗ 未配置", settings.llm_api_key_configured ? "success" : "warning")}
         </div>
       </article>

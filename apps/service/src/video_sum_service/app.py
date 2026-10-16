@@ -23,9 +23,11 @@ from video_sum_infra.runtime import (
     write_runtime_metadata,
 )
 
+from video_sum_service import cli_idle
 from video_sum_service.context import CACHE_STATIC_DIR, WEB_STATIC_DIR, access_token_manager, app_info, logger, settings_manager
 from video_sum_service.integrations import probe_asr_connection, probe_llm_connection
 from video_sum_service.repository import SqliteTaskRepository
+from video_sum_service.knowledge.job_coordinator import KnowledgeJobCoordinator
 from video_sum_service.routers.system import router as system_router
 from video_sum_service.routers.knowledge import router as knowledge_router
 from video_sum_service.routers.tasks import router as tasks_router
@@ -112,13 +114,18 @@ async def lifespan(app: FastAPI):
     app.state.task_repository = repository
     app.state.db_connection = connection
     app.state.settings_manager = settings_manager
+    knowledge_job_coordinator = KnowledgeJobCoordinator(repository, current_settings)
+    knowledge_job_coordinator.start()
+    app.state.knowledge_job_coordinator = knowledge_job_coordinator
     initialize_runtime_startup_state(app.state, current_settings)
+    cli_idle.start_watchdog(repository)
     start_runtime_startup(app.state, repository, current_settings, recover_incomplete_tasks)
     logger.info("application core startup complete database=%s", current_settings.database_url)
     try:
         yield
     finally:
         request_runtime_startup_shutdown(app.state)
+        knowledge_job_coordinator.stop()
         startup_thread = getattr(app.state, "runtime_startup_thread", None)
         if startup_thread is not None and startup_thread.is_alive():
             startup_thread.join(timeout=10)
@@ -141,6 +148,13 @@ app.include_router(system_router)
 app.include_router(videos_router)
 app.include_router(tasks_router)
 app.include_router(knowledge_router)
+
+
+@app.middleware("http")
+async def touch_cli_activity(request, call_next):
+    if cli_idle.enabled():
+        cli_idle.touch()
+    return await call_next(request)
 
 
 @app.middleware("http")

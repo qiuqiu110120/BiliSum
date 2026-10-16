@@ -1,8 +1,60 @@
-import type { PageAggregateStatus, TaskDetail, TaskMindMapResponse, TaskResult, TaskSummary, TimelineItem, VideoPageBatchOption, VideoPageOption } from "./types";
+import type { LlmUsageRecord, PageAggregateStatus, TaskDetail, TaskMindMapResponse, TaskResult, TaskSummary, TimelineItem, VideoPageBatchOption, VideoPageOption } from "./types";
 
 export type DetailTab = "knowledge" | "summary" | "mindmap";
 export type TaskPanelState = "collapsed" | "expanded";
 export type KnowledgeCardKind = "overview" | "key-point" | "chapter";
+
+export type TokenUsageMetrics = {
+  totalTokens: number | null;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  cacheHitTokens: number | null;
+  cacheMissTokens: number | null;
+  cacheCreationTokens: number | null;
+  cacheHitRate: number | null;
+  cacheReported: boolean;
+  breakdown: LlmUsageRecord[];
+};
+
+function normalizeOptionalCount(value?: number | null): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+export function buildTokenUsageMetrics(result?: Pick<
+  TaskResult,
+  | "llm_total_tokens"
+  | "llm_prompt_tokens"
+  | "llm_completion_tokens"
+  | "llm_prompt_cache_hit_tokens"
+  | "llm_prompt_cache_miss_tokens"
+  | "llm_prompt_cache_creation_tokens"
+  | "llm_usage_breakdown"
+> | null): TokenUsageMetrics {
+  const totalTokens = normalizeOptionalCount(result?.llm_total_tokens);
+  const promptTokens = normalizeOptionalCount(result?.llm_prompt_tokens);
+  const completionTokens = normalizeOptionalCount(result?.llm_completion_tokens);
+  const cacheHitTokens = normalizeOptionalCount(result?.llm_prompt_cache_hit_tokens);
+  const reportedCacheMissTokens = normalizeOptionalCount(result?.llm_prompt_cache_miss_tokens);
+  const cacheCreationTokens = normalizeOptionalCount(result?.llm_prompt_cache_creation_tokens);
+  const cacheReported = cacheHitTokens != null || reportedCacheMissTokens != null || cacheCreationTokens != null;
+  const cacheMissTokens = reportedCacheMissTokens
+    ?? (promptTokens != null && cacheHitTokens != null ? Math.max(0, promptTokens - cacheHitTokens) : null);
+  const cacheHitRate = cacheReported && promptTokens != null && promptTokens > 0 && cacheHitTokens != null
+    ? Math.max(0, Math.min(1, cacheHitTokens / promptTokens))
+    : null;
+
+  return {
+    totalTokens,
+    promptTokens,
+    completionTokens,
+    cacheHitTokens,
+    cacheMissTokens,
+    cacheCreationTokens,
+    cacheHitRate,
+    cacheReported,
+    breakdown: Array.isArray(result?.llm_usage_breakdown) ? result.llm_usage_breakdown : [],
+  };
+}
 
 export type KnowledgeCard = {
   id: string;
@@ -127,6 +179,9 @@ export function describeUserFacingErrorMessage(rawMessage?: string | null): stri
   }
   if (/not a valid json|未返回合法 json/.test(normalized)) {
     return "模型接口能连通，但没有按要求返回合法 JSON，所以无法继续生成摘要。建议更换模型，或先到设置页点击测试按钮检查。";
+  }
+  if (/no readable message content|没有返回可读取的消息内容/.test(normalized)) {
+    return "模型接口已响应，但没有返回可读取的消息内容。系统会按设置重试；如果仍失败，请检查模型兼容性和响应格式。";
   }
   if (/siliconflow asr authentication failed|asr 测试失败：认证失败/.test(normalized)) {
     return "语音识别 API Key 校验失败。请检查 SiliconFlow API Key 是否正确。";

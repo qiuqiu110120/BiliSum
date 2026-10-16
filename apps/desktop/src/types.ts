@@ -36,6 +36,18 @@ export type TaskMindMap = {
   nodes: MindMapNode[];
 };
 
+export type LlmUsageRecord = {
+  stage?: string;
+  provider?: string | null;
+  model?: string | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+  cache_hit_tokens?: number | null;
+  cache_miss_tokens?: number | null;
+  cache_creation_tokens?: number | null;
+};
+
 export type TaskResult = {
   overview: string;
   knowledge_note_markdown?: string;
@@ -49,6 +61,10 @@ export type TaskResult = {
   llm_prompt_tokens?: number | null;
   llm_completion_tokens?: number | null;
   llm_total_tokens?: number | null;
+  llm_prompt_cache_hit_tokens?: number | null;
+  llm_prompt_cache_miss_tokens?: number | null;
+  llm_prompt_cache_creation_tokens?: number | null;
+  llm_usage_breakdown?: LlmUsageRecord[];
   mindmap_status?: TaskMindMapStatus;
   mindmap_error_message?: string | null;
   mindmap_artifact_path?: string | null;
@@ -104,6 +120,7 @@ export type VideoLibraryState = {
   videos: VideoAssetSummary[];
   folders: VideoFolder[];
   preferences: VideoLibraryPreferences;
+  collections: VideoCollection[];
 };
 
 export type VideoPageOption = {
@@ -121,6 +138,60 @@ export type VideoPageBatchOption = VideoPageOption & {
   has_completed_result?: boolean;
 };
 
+export type VideoCollectionItem = {
+  position: number;
+  custom_position?: number | null;
+  source_section_id?: string | null;
+  source_section_title?: string | null;
+  source_section_position?: number | null;
+  bvid: string;
+  title: string;
+  source_url: string;
+  cover_url: string;
+  duration?: number | null;
+  is_current?: boolean;
+  video_id?: string | null;
+  has_result?: boolean;
+  latest_status?: TaskStatus | null;
+  last_summary_at?: string | null;
+  asset_updated_at?: string | null;
+  is_global_visible?: boolean;
+  is_new?: boolean;
+};
+
+export type VideoCollection = {
+  collection_id: string;
+  title: string;
+  cover_url: string;
+  global_order: number;
+  folder_order?: number;
+  folder_id?: string | null;
+  folder_ids?: string[];
+  global_pinned?: boolean;
+  folder_pinned?: boolean;
+  is_favorite?: boolean;
+  favorite_updated_at?: string | null;
+  latest_video_updated_at?: string | null;
+  owner_mid?: string | null;
+  owner_name?: string | null;
+  owner_face?: string | null;
+  owner_url?: string | null;
+  item_count: number;
+  items: VideoCollectionItem[];
+  source_url?: string;
+  summarized_count?: number;
+  unsummarized_count?: number;
+  last_checked_at?: string | null;
+  auto_check_on_open?: boolean;
+  view_sort_mode?: CollectionSortMode;
+  view_group_mode?: CollectionGroupMode;
+  new_items?: VideoCollectionItem[];
+};
+
+export type CollectionSortMode = "source" | "source_desc" | "recent_summary" | "recent_update" | "duration" | "custom";
+
+export type CollectionGroupMode = "none" | "status" | "source_section";
+
 export type VideoAssetDetail = VideoAssetSummary & {
   latest_result?: TaskResult | null;
   latest_error_message?: string | null;
@@ -131,6 +202,7 @@ export type VideoProbeResult = {
   cached: boolean;
   requires_selection: boolean;
   pages: VideoPageOption[];
+  collection?: VideoCollection | null;
 };
 
 export type PromptPreset = {
@@ -208,6 +280,18 @@ export type VideoTaskBatchResponse = {
   created_tasks: TaskDetail[];
   skipped_pages: VideoTaskBatchPageResult[];
   conflict_pages: VideoTaskBatchPageResult[];
+};
+
+export type VideoCollectionTaskCreateResponse = {
+  batch_id: string;
+  replayed: boolean;
+  created_tasks: TaskDetail[];
+  dispatch_failures: Array<{
+    task_id: string;
+    video_id?: string | null;
+    error_code: string;
+    error_message: string;
+  }>;
 };
 
 export type TaskMindMapResponse = {
@@ -408,6 +492,8 @@ export type ServiceSettings = {
   enable_cache: boolean;
   language: string;
   summary_mode: string;
+  summary_context_mode: string;
+  summary_full_context_max_chars: number;
   prompt_router_mode: "auto" | "confirm" | string;
   prompt_presets_path: string;
   llm_enabled: boolean;
@@ -428,10 +514,18 @@ export type ServiceSettings = {
   visual_evidence_image_quality: number;
   visual_evidence_timeout_seconds: number;
   visual_evidence_retry_count: number;
+  twelvelabs_summary_enabled: boolean;
+  twelvelabs_api_key: string;
+  twelvelabs_api_key_configured?: boolean;
+  twelvelabs_model: string;
+  twelvelabs_base_url: string;
+  twelvelabs_prompt: string;
   llm_provider: string;
   llm_api_key: string;
   llm_base_url: string;
   llm_model: string;
+  llm_thinking_type: "enabled" | "disabled" | string;
+  llm_reasoning_effort: "low" | "high" | "max" | string;
   llm_api_key_configured?: boolean;
   knowledge_llm_mode: string;
   knowledge_llm_enabled: boolean;
@@ -459,6 +553,9 @@ export type ServiceSettings = {
   visual_vlm_prompt: string;
   summary_chunk_target_chars: number;
   summary_chunk_overlap_segments: number;
+  transcription_concurrency: number;
+  llm_concurrency: number;
+  /** Legacy alias kept for older service versions/clients. */
   task_concurrency: number;
   mindmap_concurrency: number;
   summary_chunk_concurrency: number;
@@ -492,6 +589,80 @@ export type SystemInfo = {
   settings?: ServiceSettings;
   environment?: EnvironmentInfo;
   runtimeStartup?: RuntimeStartupInfo;
+  worker?: WorkerSnapshot | null;
+};
+
+export type WorkerQueueSnapshot = {
+  concurrency?: number;
+  pending?: number;
+  running?: number;
+  completed?: number;
+  total?: number;
+  completed_tasks?: number;
+  total_tasks?: number;
+  token_consumed?: number;
+  total_tokens?: number;
+  runtime_seconds?: number;
+  started_at?: string | null;
+  completed_at?: string | null;
+  status?: string;
+  items?: WorkerQueueItem[];
+};
+
+export type WorkerQueueItem = {
+  task_id?: string;
+  title?: string | null;
+  progress?: number;
+  status?: string;
+  message?: string | null;
+};
+
+export type WorkerBatchSnapshot = WorkerQueueSnapshot & {
+  id?: string | null;
+  batch_id?: string | null;
+  state?: string;
+  visible?: boolean;
+  mode?: "parallel" | "serial" | string;
+  concurrency_mode?: "parallel" | "serial" | string;
+  remaining?: number;
+  running_tasks?: number;
+  pending_tasks?: number;
+  transcription_concurrency?: number;
+  llm_concurrency?: number;
+  transcription_pending_tasks?: number;
+  transcription_running_tasks?: number;
+  llm_pending_tasks?: number;
+  llm_running_tasks?: number;
+};
+
+export type WorkerSnapshot = {
+  accept_new_work?: boolean;
+  shutdown_requested?: boolean;
+  dispatch_threads?: number;
+  job_threads?: number;
+  queues?: {
+    task?: WorkerQueueSnapshot;
+    transcription?: WorkerQueueSnapshot;
+    llm?: WorkerQueueSnapshot;
+    mindmap?: WorkerQueueSnapshot;
+    visual?: WorkerQueueSnapshot;
+    [key: string]: WorkerQueueSnapshot | undefined;
+  };
+  task?: WorkerQueueSnapshot;
+  batch?: WorkerBatchSnapshot | null;
+  active_batch?: WorkerBatchSnapshot | null;
+  completion?: WorkerBatchSnapshot | null;
+  completed?: number;
+  completed_tasks?: number;
+  total?: number;
+  total_tasks?: number;
+  token_consumed?: number;
+  total_tokens?: number;
+  runtime_seconds?: number;
+  runtime?: number;
+  mode?: "parallel" | "serial" | string;
+  concurrency_mode?: "parallel" | "serial" | string;
+  has_active_tasks?: boolean;
 };
 
 export type RuntimeStartupInfo = {
@@ -652,6 +823,69 @@ export type KnowledgeChatHistoryItem = {
   role: "user" | "assistant";
   content: string;
 };
+
+export type KnowledgeReference = {
+  kind: "video" | "folder";
+  id: string;
+  label: string;
+};
+
+export type KnowledgeConversation = {
+  conversation_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  last_message_at?: string | null;
+  message_count: number;
+  preview: string;
+};
+
+export type KnowledgeMessage = {
+  message_id: string;
+  conversation_id: string;
+  sequence: number;
+  role: "user" | "assistant" | "system";
+  content: string;
+  reasoning: string;
+  status: "streaming" | "completed" | "error" | "interrupted" | "waiting_tasks";
+  sources: KnowledgeSourceRef[];
+  tools: KnowledgeToolTrace[];
+  references: KnowledgeReference[];
+  job_id?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type KnowledgeJobItem = {
+  task_id: string;
+  video_id?: string | null;
+  title: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  progress: number;
+  message: string;
+  error_message?: string | null;
+};
+
+export type KnowledgeJob = {
+  job_id: string;
+  conversation_id: string;
+  assistant_message_id: string;
+  kind: string;
+  status: string;
+  query: string;
+  progress: number;
+  error_message?: string | null;
+  items: KnowledgeJobItem[];
+  agent_round: number;
+  agent_phase: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+};
+
+export type KnowledgeSuggestion = { text: string; reason: string };
+export type KnowledgeSuggestionsResponse = { suggestions: KnowledgeSuggestion[]; generated_at: string; based_on: string[] };
+export type KnowledgeReferenceItem = KnowledgeReference & { subtitle: string; cover_url: string; updated_at?: string | null };
 
 export type KnowledgeToolTrace = {
   id: string;

@@ -1,5 +1,5 @@
-import { Link } from "react-router-dom";
-import type { MouseEvent, SyntheticEvent } from "react";
+import { Link, useLocation } from "react-router-dom";
+import type { MouseEvent, PointerEvent as ReactPointerEvent, SyntheticEvent } from "react";
 
 import { platformLabel, taskStatusClass } from "../appModel";
 import { GripVerticalIcon, PinIcon } from "./AppIcons";
@@ -9,7 +9,10 @@ import { formatDateTime, formatDuration, taskStatusLabel } from "../utils";
 export function VideoCard({
   video,
   folderName,
+  metaLabel,
+  showDragHandle = false,
   canPinInFolder = false,
+  selection,
   onToggleFavorite,
   onToggleGlobalPin,
   onToggleFolderPin,
@@ -17,12 +20,23 @@ export function VideoCard({
 }: {
   video: VideoAssetSummary;
   folderName?: string;
+  metaLabel?: string;
+  showDragHandle?: boolean;
   canPinInFolder?: boolean;
+  selection?: {
+    id: string;
+    checked: boolean;
+    disabled?: boolean;
+    onChange(): void;
+    onToggle(event: MouseEvent<HTMLElement>): void;
+    onPointerDown(event: ReactPointerEvent<HTMLElement>): void;
+  };
   onToggleFavorite?: (videoId: string, nextFavorite: boolean) => Promise<void>;
   onToggleGlobalPin?: (videoId: string, nextPinned: boolean) => Promise<void>;
   onToggleFolderPin?: (videoId: string, nextPinned: boolean) => Promise<void>;
   onOpenContextMenu?: (event: MouseEvent, videoId: string) => void;
 }) {
+  const location = useLocation();
   const badgeClass = taskStatusClass(video.latest_status);
   const isMultiPageVideo = video.pages.length > 1;
   const platformClass = video.platform ? `is-${video.platform.toLowerCase()}` : "";
@@ -57,9 +71,59 @@ export function VideoCard({
   }
 
   return (
-    <Link className="video-card" to={`/videos/${video.video_id}`} draggable={false} onContextMenu={(event) => onOpenContextMenu?.(event, video.video_id)}>
+    <Link
+      className={`video-card ${selection?.checked ? "is-selected" : ""} ${selection?.onToggle ? "is-selection-enabled" : ""}`.trim()}
+      data-collection-selection-id={selection?.id}
+      to={`/videos/${video.video_id}`}
+      state={{ from: `${location.pathname}${location.search}${location.hash}` }}
+      draggable={false}
+      onClick={(event) => {
+        if (selection?.onToggle) {
+          event.preventDefault();
+          event.stopPropagation();
+          selection.onToggle(event);
+        }
+      }}
+      onPointerDown={(event) => {
+        const target = event.target as HTMLElement;
+        if (target.closest("button, input")) return;
+        selection?.onPointerDown(event);
+      }}
+      onContextMenu={(event) => onOpenContextMenu?.(event, video.video_id)}
+    >
       <div className="video-card-cover">
-        <span className="video-card-drag-handle" title="拖动排序" aria-hidden="true"><GripVerticalIcon /></span>
+        {showDragHandle ? <span className="video-card-drag-handle" title="拖动排序" aria-hidden="true"><GripVerticalIcon /></span> : null}
+        {selection ? (
+          <>
+            <input
+              className="video-card-select"
+              type="checkbox"
+              aria-label={`选择 ${video.title}`}
+              checked={selection.checked}
+              disabled={selection.disabled}
+              onPointerDown={(event) => {
+                event.stopPropagation();
+                selection.onPointerDown(event);
+              }}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                selection.onToggle(event);
+              }}
+              onChange={selection.onChange}
+            />
+            <span
+              className={`video-card-select-indicator${selection.checked ? " is-checked" : ""}`}
+              aria-hidden="true"
+            >
+              {selection.checked ? (
+                <svg viewBox="0 0 16 16" fill="none">
+                  <path d="m3.25 8.25 3.1 3.1 6.4-6.7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              ) : null}
+            </span>
+          </>
+        ) : null}
         {video.cover_url ? (
           <>
             <img src={video.cover_url} alt={video.title} loading="lazy" draggable={false} onError={handleImageError} />
@@ -116,7 +180,7 @@ export function VideoCard({
         </div>
         <h3>{video.title}</h3>
         <div className="video-card-meta">
-          <span>{formatDateTime(video.updated_at)}</span>
+          <span>{metaLabel || formatDateTime(video.updated_at)}</span>
           <span className="video-card-result-state">{resultStateLabel}</span>
         </div>
         {folderName ? <div className="video-card-folder">{folderName}</div> : null}

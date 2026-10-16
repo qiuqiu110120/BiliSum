@@ -11,6 +11,12 @@ import type {
   KnowledgeStatsResponse,
   KnowledgeTagListResponse,
   KnowledgeToolTrace,
+  KnowledgeConversation,
+  KnowledgeMessage,
+  KnowledgeJob,
+  KnowledgeReference,
+  KnowledgeReferenceItem,
+  KnowledgeSuggestionsResponse,
   LlmTestResponse,
   PromptMatchResult,
   PromptPreset,
@@ -31,6 +37,8 @@ import type {
   VideoLibraryState,
   VideoProbeResult,
   VideoAssetSummary,
+  VideoCollection,
+  VideoCollectionTaskCreateResponse,
   VideoTaskBatchRequest,
   VideoTaskBatchResponse,
 } from "./types";
@@ -262,6 +270,83 @@ export const api = {
   getVideoLibrary() {
     return fetchJson<VideoLibraryState>("/api/v1/videos/library");
   },
+  getVideoCollection(collectionId: string) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}`);
+  },
+  refreshVideoCollection(collectionId: string) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/refresh`, { method: "POST" });
+  },
+  updateVideoCollectionSettings(collectionId: string, payload: {
+    auto_check_on_open?: boolean;
+    view_sort_mode?: import("./types").CollectionSortMode;
+    view_group_mode?: import("./types").CollectionGroupMode;
+  }) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  reorderVideoCollectionItems(collectionId: string, orderedBvids: string[]) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/items/order`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ordered_bvids: orderedBvids }),
+    });
+  },
+  createVideoCollectionTasks(collectionId: string, payload: {
+    batch_id?: string;
+    ordered_video_ids: string[];
+    visual_note_mode?: string | null;
+    prompt_preset_id?: string | null;
+    summary_scope?: string | null;
+  }) {
+    return fetchJson<VideoCollectionTaskCreateResponse>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/tasks/batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  deleteVideoCollection(collectionId: string, mode: "detach" | "delete_contents") {
+    return fetchJson<{ deleted: boolean; collection_id: string; mode: string; video_ids: string[] }>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+  },
+  setVideoCollectionFavorite(collectionId: string, payload: { is_favorite: boolean }) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/favorite`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  moveVideoCollectionToFolder(collectionId: string, payload: { folder_id?: string | null; folder_ids?: string[] | null }) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/move`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  setVideoCollectionPin(collectionId: string, payload: { global_pinned?: boolean | null; folder_pinned?: boolean | null }) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/pin`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  addVideoCollectionItems(collectionId: string, bvids: string[] = []) {
+    return fetchJson<VideoCollection>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/items`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bvids }),
+    });
+  },
+  promoteVideoCollectionItem(collectionId: string, videoId: string) {
+    return fetchJson<VideoAssetDetail>(`/api/v1/videos/collections/${encodeURIComponent(collectionId)}/items/${encodeURIComponent(videoId)}/promote`, {
+      method: "POST",
+    });
+  },
   updateVideoLibraryPreferences(payload: VideoLibraryPreferences) {
     return fetchJson<VideoLibraryPreferences>("/api/v1/videos/library/preferences", {
       method: "PUT",
@@ -315,6 +400,13 @@ export const api = {
   },
   reorderVideos(payload: { video_ids: string[]; folder_id?: string | null }) {
     return fetchJson<VideoAssetSummary[]>("/api/v1/videos/reorder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
+  reorderVideoLibrary(payload: { items: Array<{ kind: "video" | "collection"; id: string }>; folder_id?: string | null }) {
+    return fetchJson<VideoLibraryState>("/api/v1/videos/library/reorder", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -609,7 +701,46 @@ export const api = {
       body: JSON.stringify(payload),
     });
   },
-  askKnowledge(payload: { query: string; context_limit?: number; history?: Array<{ role: "user" | "assistant"; content: string }> }) {
+  listKnowledgeConversations() {
+    return fetchJson<KnowledgeConversation[]>("/api/v1/knowledge/conversations");
+  },
+  createKnowledgeConversation(title?: string) {
+    return fetchJson<KnowledgeConversation>("/api/v1/knowledge/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(title ? { title } : {}),
+    });
+  },
+  renameKnowledgeConversation(conversationId: string, title: string) {
+    return fetchJson<KnowledgeConversation>(`/api/v1/knowledge/conversations/${encodeURIComponent(conversationId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+  },
+  deleteKnowledgeConversation(conversationId: string) {
+    return fetchJson<{ deleted: boolean }>(`/api/v1/knowledge/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+  },
+  getKnowledgeMessages(conversationId: string) {
+    return fetchJson<{ conversation_id: string; messages: KnowledgeMessage[] }>(`/api/v1/knowledge/conversations/${encodeURIComponent(conversationId)}/messages`);
+  },
+  getKnowledgeReferences(query = "") {
+    const url = new URL("/api/v1/knowledge/references", window.location.origin);
+    if (query.trim()) {
+      url.searchParams.set("q", query.trim());
+    }
+    return fetchJson<{ items: KnowledgeReferenceItem[] }>(url.toString());
+  },
+  getKnowledgeSuggestions() {
+    return fetchJson<KnowledgeSuggestionsResponse>("/api/v1/knowledge/suggestions");
+  },
+  getKnowledgeJob(jobId: string) {
+    return fetchJson<KnowledgeJob>(`/api/v1/knowledge/jobs/${encodeURIComponent(jobId)}`);
+  },
+  reaggregateKnowledgeJob(jobId: string) {
+    return fetchJson<KnowledgeJob>(`/api/v1/knowledge/jobs/${encodeURIComponent(jobId)}/reaggregate`, { method: "POST" });
+  },
+  askKnowledge(payload: { query: string; context_limit?: number; history?: Array<{ role: "user" | "assistant"; content: string }>; references?: KnowledgeReference[] }) {
     return fetchJson<KnowledgeAskResponse>("/api/v1/knowledge/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -617,18 +748,23 @@ export const api = {
     });
   },
   async streamKnowledgeAsk(
-    payload: { query: string; context_limit?: number; history?: Array<{ role: "user" | "assistant"; content: string }> },
+    payload: { query: string; context_limit?: number; history?: Array<{ role: "user" | "assistant"; content: string }>; references?: KnowledgeReference[] },
     handlers: {
       onTool?(tool: KnowledgeToolTrace): void;
       onReasoningDelta?(delta: string): void;
       onTextDelta?(delta: string): void;
       onSources?(sources: KnowledgeAskResponse["sources"]): void;
       onDone?(result: KnowledgeAskResponse): void;
+      onJob?(job: KnowledgeJob): void;
+      onMessage?(message: { user_message_id?: string; assistant_message_id?: string }): void;
       onError?(message: string): void;
     },
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; conversationId?: string },
   ) {
-    const response = await fetch("/api/v1/knowledge/ask/stream", await withDesktopAuth({
+    const streamPath = options?.conversationId
+      ? `/api/v1/knowledge/conversations/${encodeURIComponent(options.conversationId)}/ask/stream`
+      : "/api/v1/knowledge/ask/stream";
+    const response = await fetch(streamPath, await withDesktopAuth({
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
       body: JSON.stringify(payload),
@@ -664,6 +800,9 @@ export const api = {
           data = parsed.data;
         }
         switch (parsed.event) {
+          case "message":
+            handlers.onMessage?.(data as { user_message_id?: string; assistant_message_id?: string });
+            break;
           case "tool":
             handlers.onTool?.(data as KnowledgeToolTrace);
             break;
@@ -678,6 +817,9 @@ export const api = {
             break;
           case "done":
             handlers.onDone?.(data as KnowledgeAskResponse);
+            break;
+          case "job":
+            handlers.onJob?.((data as { job?: KnowledgeJob }).job as KnowledgeJob);
             break;
           case "error":
             handlers.onError?.(String((data as { message?: string }).message || "流式问答失败"));

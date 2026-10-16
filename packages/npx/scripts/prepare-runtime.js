@@ -4,6 +4,7 @@ const { basename, join, resolve } = require("node:path");
 const packageRoot = resolve(__dirname, "..");
 const repoRoot = resolve(packageRoot, "..", "..");
 const runtimeRoot = join(packageRoot, "runtime");
+const skillRoot = join(packageRoot, "skill");
 
 function copyDir(from, to) {
   if (!existsSync(from)) {
@@ -29,7 +30,13 @@ function copyPackage(relativePath) {
 }
 
 function copyWebStatic() {
+  // Web UI (settings page) is optional for the CLI: it is only needed for
+  // `bilisum --setting`. Skip gracefully when the static build is absent.
   const source = join(repoRoot, "apps", "web", "static");
+  if (!existsSync(source)) {
+    console.log("apps/web/static not found; CLI --setting page will be unavailable in this package.");
+    return;
+  }
   const target = join(runtimeRoot, "apps", "web", "static");
   copyDir(source, target);
 
@@ -52,13 +59,23 @@ function copyWebStatic() {
   }
 }
 
+function copyAgentSkill() {
+  const source = join(repoRoot, ".agents", "skills", "bilisum-video-understanding");
+  const target = join(skillRoot, "bilisum-video-understanding");
+  copyDir(source, target);
+}
+
 rmSync(runtimeRoot, { recursive: true, force: true });
+rmSync(skillRoot, { recursive: true, force: true });
 mkdirSync(runtimeRoot, { recursive: true });
 
 copyPackage(join("packages", "infra"));
 copyPackage(join("packages", "core"));
 copyPackage(join("apps", "service"));
 copyWebStatic();
-copyFileSync(join(repoRoot, "VERSION"), join(runtimeRoot, "VERSION"));
+copyAgentSkill();
+if (existsSync(join(repoRoot, "VERSION"))) {
+  copyFileSync(join(repoRoot, "VERSION"), join(runtimeRoot, "VERSION"));
+}
 
 console.log(`Prepared BiliSum npx runtime at ${runtimeRoot}`);

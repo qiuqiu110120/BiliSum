@@ -195,6 +195,50 @@ def test_build_fallback_segments_from_long_comma_only_transcript_splits_into_mul
     assert "[01:" not in rendered or float(segments[-1]["end"]) <= 75.0
 
 
+def test_mindmap_uses_local_fallback_when_repair_request_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _build_runner()
+    calls: list[str] = []
+
+    def fake_request(*, usage_stage: str, **_kwargs):
+        calls.append(usage_stage)
+        if usage_stage == "mindmap":
+            return {
+                "title": "示例导图",
+                "root": "root",
+                "nodes": [
+                    {
+                        "id": "root",
+                        "label": "示例导图",
+                        "type": "root",
+                        "summary": "概览",
+                        "children": [
+                            {"id": "theme-1", "label": "单一分支", "type": "theme", "summary": "内容"}
+                        ],
+                    }
+                ],
+            }
+        raise RuntimeError("repair timeout")
+
+    monkeypatch.setattr(runner, "_request_llm_json", fake_request)
+    mindmap, usage = runner._generate_mindmap_with_llm(
+        title="示例视频",
+        result=TaskResult(
+            overview="视频概览",
+            key_points=["关键点一", "关键点二"],
+            timeline=[
+                {"title": "概念", "start": 0, "summary": "概念说明"},
+                {"title": "方法", "start": 10, "summary": "方法说明"},
+                {"title": "应用", "start": 20, "summary": "应用说明"},
+            ],
+        ),
+    )
+
+    root = next(node for node in mindmap.nodes if node.id == mindmap.root)
+    assert len(root.children) >= 3
+    assert calls == ["mindmap", "mindmap_repair"]
+    assert usage == []
+
+
 def test_transcribe_uses_siliconflow_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = RealPipelineRunner(
         PipelineSettings(
@@ -714,9 +758,76 @@ def test_preflight_llm_timeout_fails_quickly(monkeypatch: pytest.MonkeyPatch, tm
         raise httpx.ReadTimeout("slow preflight")
 
     monkeypatch.setattr(runner, "_request_llm_json", fake_request)
+    monkeypatch.setattr("video_sum_core.pipeline.real.time.sleep", lambda _seconds: None)
 
     with pytest.raises(VideoSumError, match="LLM API 检查超时"):
         runner._preflight_llm_availability()
+
+
+def test_preflight_llm_retries_unreadable_response_using_configured_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://api.example.com/v1",
+            llm_model="test-model",
+            summary_chunk_retry_count=5,
+        )
+    )
+    calls = 0
+
+    def fake_request(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls <= 5:
+            raise VideoSumError("LLM returned no readable message content.")
+        return {}
+
+    monkeypatch.setattr(runner, "_request_llm_json", fake_request)
+    monkeypatch.setattr("video_sum_core.pipeline.real.time.sleep", lambda _seconds: None)
+
+    runner._preflight_llm_availability()
+
+    assert calls == 6
+
+
+def test_non_chunk_llm_request_retries_unreadable_response_using_configured_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://api.example.com/v1",
+            llm_model="test-model",
+            summary_chunk_retry_count=5,
+        )
+    )
+    calls = 0
+
+    def fake_request(**_kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls <= 5:
+            raise VideoSumError("LLM returned no readable message content.")
+        return {"overview": "ok"}
+
+    monkeypatch.setattr(runner, "_request_llm_json", fake_request)
+    monkeypatch.setattr("video_sum_core.pipeline.real.time.sleep", lambda _seconds: None)
+
+    result = runner._request_llm_json_with_retries(
+        base_url="https://api.example.com/v1",
+        payload={"model": "test-model", "messages": []},
+    )
+
+    assert result == {"overview": "ok"}
+    assert calls == 6
 
 
 def test_llm_json_request_normalizes_mimo_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -727,6 +838,8 @@ def test_llm_json_request_normalizes_mimo_model(monkeypatch: pytest.MonkeyPatch,
             llm_api_key="test-key",
             llm_base_url="https://api.example.com/v1",
             llm_model="MiMo-V2.5-Pro",
+            llm_thinking_type="disabled",
+            llm_reasoning_effort="max",
         )
     )
     calls: list[dict[str, object]] = []
@@ -740,7 +853,13 @@ def test_llm_json_request_normalizes_mimo_model(monkeypatch: pytest.MonkeyPatch,
         def json(self) -> dict[str, object]:
             return {
                 "choices": [{"message": {"content": '{"overview":"ok"}'}}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                    "prompt_cache_hit_tokens": 6,
+                    "prompt_cache_miss_tokens": 4,
+                },
             }
 
     class FakeClient:
@@ -766,6 +885,10 @@ def test_llm_json_request_normalizes_mimo_model(monkeypatch: pytest.MonkeyPatch,
 
     assert result["overview"] == "ok"
     assert calls[0]["json"]["model"] == "mimo-v2.5-pro"
+    assert calls[0]["json"]["thinking"] == {"type": "disabled"}
+    assert calls[0]["json"]["reasoning_effort"] == "max"
+    assert result["llm_prompt_cache_hit_tokens"] == 6
+    assert result["llm_prompt_cache_miss_tokens"] == 4
 
 
 def test_llm_json_request_accepts_choice_text_response(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -811,7 +934,64 @@ def test_llm_json_request_accepts_choice_text_response(monkeypatch: pytest.Monke
     assert result["overview"] == "ok from text"
 
 
-def test_llm_summary_payload_disables_thinking_in_chat_template(tmp_path: Path) -> None:
+def test_llm_json_request_reads_openai_nested_cached_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://api.example.com/v1",
+            llm_model="test-model",
+        )
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [{"message": {"content": '{"overview":"ok"}'}}],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 2,
+                    "total_tokens": 22,
+                    "prompt_tokens_details": {"cached_tokens": 12, "cache_creation_input_tokens": 5},
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, *args, **kwargs) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr("video_sum_core.pipeline.real.httpx.Client", FakeClient)
+
+    result = runner._request_llm_json(
+        base_url="https://api.example.com/v1",
+        payload={"model": "test-model", "messages": []},
+    )
+
+    assert result["llm_prompt_tokens"] == 20
+    assert result["llm_prompt_cache_hit_tokens"] == 12
+    assert result["llm_prompt_cache_miss_tokens"] == 8
+    assert result["llm_prompt_cache_creation_tokens"] == 5
+
+
+def test_llm_summary_payload_keeps_legacy_thinking_options_for_compatibility(tmp_path: Path) -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=tmp_path, llm_model="test-model"))
 
     payload = runner._build_llm_summary_payload(
@@ -820,9 +1000,151 @@ def test_llm_summary_payload_disables_thinking_in_chat_template(tmp_path: Path) 
         segments_excerpt='[{"start":0,"text":"内容"}]',
     )
 
-    assert payload["response_format"] == {"type": "json_object"}
+    assert "response_format" not in payload  # 已移除：本地模型不支持 json_object 模式
     assert payload["enable_thinking"] is False
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_gemini_openai_compatible_request_omits_legacy_thinking_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+            llm_model="gemini-2.5-pro",
+        )
+    )
+    calls: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"choices": [{"message": {"content": '{"overview":"ok"}'}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, headers: dict[str, str], json: dict[str, object]) -> FakeResponse:
+            calls.append({"url": url, "headers": headers, "json": json})
+            return FakeResponse()
+
+    monkeypatch.setattr("video_sum_core.pipeline.real.httpx.Client", FakeClient)
+
+    result = runner._request_llm_json(
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        payload={
+            "model": "gemini-2.5-pro",
+            "messages": [],
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    assert result["overview"] == "ok"
+    sent_payload = calls[0]["json"]
+    assert isinstance(sent_payload, dict)
+    assert sent_payload["model"] == "gemini-2.5-pro"
+    assert "enable_thinking" not in sent_payload
+    assert "chat_template_kwargs" not in sent_payload
+
+
+def test_full_summary_context_uses_canonical_transcript_and_anchor_only_segments(
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://example.com/v1",
+            llm_model="test-model",
+            summary_context_mode="full",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    def fake_request(**kwargs: object) -> dict[str, object]:
+        captured["payload"] = kwargs["payload"]
+        return {"title": "标题", "overview": "概览", "bulletPoints": [], "chapters": []}
+
+    runner._request_llm_json = fake_request  # type: ignore[method-assign]
+    summary = runner._summarize_with_llm(
+        transcript="旧转写不应作为第二份正文发送",
+        segments=[
+            {"start": 0, "end": 2, "text": "第一段正文"},
+            {"start": 2, "end": 4, "text": "第二段正文"},
+        ],
+        title="标题",
+        emit=lambda *_args, **_kwargs: None,
+    )
+
+    assert summary["overview"] == "概览"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    user_message = next(message for message in payload["messages"] if message["role"] == "user")
+    assert "[00:00] 第一段正文" in user_message["content"]
+    assert "[00:02] 第二段正文" in user_message["content"]
+    assert user_message["content"].count("第二段正文") == 1
+    assert '"text"' not in user_message["content"].split("分段数据节选：", 1)[-1]
+
+
+def test_auto_summary_context_falls_back_to_chunks_when_transcript_is_long(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://example.com/v1",
+            llm_model="test-model",
+            summary_context_mode="auto",
+            summary_full_context_max_chars=800,
+            summary_chunk_target_chars=800,
+        )
+    )
+    calls: list[str] = []
+
+    def fake_chunk(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append("chunk")
+        chunk = args[2]
+        assert isinstance(chunk, dict)
+        return {"chunk_index": chunk["index"], "overview": "分块"}
+
+    monkeypatch.setattr(runner, "_request_llm_summary_chunk", fake_chunk)
+    monkeypatch.setattr(
+        runner,
+        "_request_llm_json",
+        lambda **kwargs: (calls.append("aggregate") or {"overview": "合并"}),
+    )
+    segments = [{"start": index, "end": index + 1, "text": "长字幕内容" * 100} for index in range(3)]
+
+    result = runner._summarize_with_llm(
+        transcript="",
+        segments=segments,
+        title="长视频",
+        emit=lambda *_args, **_kwargs: None,
+    )
+
+    assert result["overview"] == "合并"
+    assert "chunk" in calls
+    assert "aggregate" in calls
 
 
 def test_llm_json_request_accepts_anthropic_messages_response(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -847,7 +1169,12 @@ def test_llm_json_request_accepts_anthropic_messages_response(monkeypatch: pytes
         def json(self) -> dict[str, object]:
             return {
                 "content": [{"type": "text", "text": '{"overview":"ok"}'}],
-                "usage": {"input_tokens": 1, "output_tokens": 2},
+                "usage": {
+                    "input_tokens": 6,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 4,
+                    "cache_creation_input_tokens": 3,
+                },
             }
 
     class FakeClient:
@@ -883,6 +1210,10 @@ def test_llm_json_request_accepts_anthropic_messages_response(monkeypatch: pytes
     assert calls[0]["headers"]["x-api-key"] == "test-key"
     assert calls[0]["headers"]["anthropic-version"] == "2023-06-01"
     assert calls[0]["json"]["system"] == "system"
+    assert result["llm_prompt_tokens"] == 13
+    assert result["llm_prompt_cache_hit_tokens"] == 4
+    assert result["llm_prompt_cache_miss_tokens"] == 9
+    assert result["llm_prompt_cache_creation_tokens"] == 3
     assert "response_format" not in calls[0]["json"]
 
 
@@ -1177,7 +1508,7 @@ def test_visual_frame_planning_prompt_renders_default_variables(tmp_path: Path, 
     )
     captured_prompt = ""
 
-    def fake_request(*, base_url, payload, timeout, retry_count):
+    def fake_request(*, base_url, payload, timeout, retry_count, **_kwargs):
         nonlocal captured_prompt
         captured_prompt = str(payload["messages"][1]["content"])
         return {

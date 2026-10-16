@@ -118,6 +118,9 @@ jobs:
       - name: Run Python tests
         run: python -m pytest -q
 
+      - name: Run npx CLI tests
+        run: node --test "packages/npx/test/*.test.js"
+
       - name: Install desktop dependencies without package install scripts
         env:
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
@@ -175,9 +178,12 @@ jobs:
 
       - name: Set up FFmpeg
         id: setup-ffmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v3
+        # Pin the Node 24-compatible action revision and a known Gyan build.
+        # "release" requires a live upstream version probe and can fail before
+        # the actual FFmpeg archive is downloaded.
+        uses: FedericoCarboni/setup-ffmpeg@8073ccb51e517ed576e6871c7f2360c6de4ebb7c
         with:
-          ffmpeg-version: release
+          ffmpeg-version: "9.0.1"
           architecture: x64
 
       - name: Build Windows package for validation
@@ -250,6 +256,8 @@ jobs:
         run: npm run package:mac
 
   validate-docker-image:
+    needs: detect-desktop-package-check
+    if: ${{ needs.detect-desktop-package-check.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
 
     steps:

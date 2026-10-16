@@ -3,6 +3,7 @@ import binascii
 import importlib.resources
 import io
 import json
+import logging
 import os
 from pathlib import Path
 import struct
@@ -15,6 +16,7 @@ from fastapi import HTTPException
 from video_sum_infra.config import ServiceSettings
 from video_sum_infra.llm import (
     ANTHROPIC_API_VERSION,
+    apply_openai_reasoning_settings,
     anthropic_messages_url,
     build_anthropic_messages_payload,
     extract_llm_message_content,
@@ -27,6 +29,8 @@ from video_sum_infra.runtime import service_log_path
 
 from video_sum_service.context import COVER_CACHE_DIR, settings_manager
 from video_sum_service.settings_manager import SettingsUpdatePayload, is_blank_or_masked_secret
+
+logger = logging.getLogger(__name__)
 
 MAX_LOG_CHARS = 20_000
 MAX_LOG_LINE_CHARS = 1_000
@@ -134,7 +138,7 @@ def cache_cover_image(source_url: str, canonical_id: str, referer_url: str | Non
 
     # 视频封面 URL 白名单
     ALLOWED_COVER_DOMAINS = [
-        "bilibili.com", "hdslb.com", "bilivideo.com",  # B站
+        "bilibili.com", "hdslb.com", "bilivideo.com", "biliimg.com",  # B站
         "ytimg.com", "ggpht.com", "googleusercontent.com",  # YouTube
         "twimg.com",  # Twitter
     ]
@@ -330,7 +334,6 @@ def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
             ],
             "temperature": 0,
             "max_tokens": 256,
-            "response_format": {"type": "json_object"},
         }
     else:
         request_payload = {
@@ -360,7 +363,14 @@ def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
             "Content-Type": "application/json",
         }
         request_url = openai_chat_completions_url(base_url)
-        request_json = request_payload
+        request_json = apply_openai_reasoning_settings(
+            request_payload,
+            thinking_type=effective_settings.llm_thinking_type,
+            reasoning_effort=effective_settings.llm_reasoning_effort,
+            provider=effective_settings.llm_provider,
+            model=model,
+            base_url=base_url,
+        )
         request_json["model"] = normalize_openai_compatible_model_name(model)
     elif use_anthropic:
         headers = {
@@ -376,7 +386,14 @@ def probe_llm_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
             "Content-Type": "application/json",
         }
         request_url = openai_chat_completions_url(base_url)
-        request_json = request_payload
+        request_json = apply_openai_reasoning_settings(
+            request_payload,
+            thinking_type=effective_settings.llm_thinking_type,
+            reasoning_effort=effective_settings.llm_reasoning_effort,
+            provider=effective_settings.llm_provider,
+            model=model,
+            base_url=base_url,
+        )
 
     probe_timeout = 120 if test_scope == "visual" else 30
     try:
